@@ -64,6 +64,13 @@
         backdrop-filter: blur(8px);
         padding: 18px 14px;
       }
+      .brand-wrap {
+        display: inline-flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+        margin-bottom: 24px;
+      }
       .brand {
         display: inline-flex;
         align-items: baseline;
@@ -72,8 +79,14 @@
         font-weight: 800;
         color: var(--accent);
         text-shadow: 0 0 18px rgba(255, 255, 255, 0.35);
-        margin-bottom: 24px;
         line-height: 0.92;
+      }
+      .brand-tagline {
+        font-size: 0.66rem;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.82);
+        margin-left: 2px;
       }
       .brand-text {
         display: inline-block;
@@ -294,9 +307,12 @@
     </div>
     <div class="app">
       <aside class="sidebar">
-        <div class="brand">
-          <span class="brand-text">Luma</span>
-          <img class="brand-popcorn" src="/static/popcorn-tub.png" alt="Popcorn tub logo accent" />
+        <div class="brand-wrap">
+          <div class="brand">
+            <span class="brand-text">Luma</span>
+            <img class="brand-popcorn" src="/static/popcorn-tub.png" alt="Popcorn tub logo accent" />
+          </div>
+          <div class="brand-tagline">BY N2CODER</div>
         </div>
         <div class="tabs">
           <button id="tabHome" class="tab-btn active">Home</button>
