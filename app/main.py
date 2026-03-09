@@ -6,6 +6,7 @@ import json
 import re
 from threading import Lock
 import time
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -105,6 +106,32 @@ def _split_text_sentences(text: str) -> list[str]:
     if remainder.strip():
         sentences.append(remainder.strip())
     return sentences
+
+
+def _extract_origin_host(origin_value: str) -> str:
+    raw = (origin_value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return (urlparse(raw).hostname or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _is_same_origin_request(request: Request) -> bool:
+    origin_host = _extract_origin_host(request.headers.get("origin", ""))
+    if not origin_host:
+        return False
+    host = (request.headers.get("host", "") or "").split(":", 1)[0].strip().lower()
+    return bool(host) and origin_host == host
+
+
+def _is_same_origin_websocket(websocket: WebSocket) -> bool:
+    origin_host = _extract_origin_host(websocket.headers.get("origin", ""))
+    if not origin_host:
+        return False
+    host = (websocket.headers.get("host", "") or "").split(":", 1)[0].strip().lower()
+    return bool(host) and origin_host == host
 
 
 def _force_progressive_chunk(buffer: str, min_chars: int = 90, target_chars: int = 150) -> tuple[str, str]:
@@ -519,8 +546,9 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
 
     protected_paths = {"/recommend", "/voice-chat", "/start-voice-session"}
     if settings.app_api_key and path in protected_paths:
-        provided = request.headers.get("X-API-Key", "")
-        if provided != settings.app_api_key:
+        provided = request.headers.get("X-API-Key", "").strip()
+        same_origin = _is_same_origin_request(request)
+        if not same_origin and provided != settings.app_api_key:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     limit_map = {
@@ -563,8 +591,9 @@ def health() -> dict:
 @app.websocket("/ws/voice")
 async def ws_voice(websocket: WebSocket) -> None:
     if settings.app_api_key:
-        provided = websocket.headers.get("x-api-key", "") or websocket.query_params.get("api_key", "")
-        if provided != settings.app_api_key:
+        provided = (websocket.headers.get("x-api-key", "") or websocket.query_params.get("api_key", "")).strip()
+        same_origin = _is_same_origin_websocket(websocket)
+        if not same_origin and provided != settings.app_api_key:
             await websocket.close(code=4401)
             return
 
