@@ -106,6 +106,7 @@ docker run --env-file .env -p 8000:8000 movie-assistant
 - Start command comes from Dockerfile (`gunicorn + uvicorn worker`)
 - Set `OPENAI_API_KEY` in Render dashboard (not in repo)
 - Keep `WEB_CONCURRENCY=1` on free/low-memory instances
+- Set `USE_VECTOR_RETRIEVER=false` on free instances to avoid loading heavy transformer runtime
 
 ## Security Notes
 

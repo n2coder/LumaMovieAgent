@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     request_timeout_sec: int = 45
 
     top_k: int = 5
+    use_vector_retriever: bool = True
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     vector_metadata_pkl: str = "app/data/movie_metadata.pkl"
     vector_index_bin: str = "app/data/faiss_index.bin"

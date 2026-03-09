@@ -18,3 +18,5 @@ services:
         value: localhost,127.0.0.1,movie-assistant-api.onrender.com
       - key: USE_FINE_TUNED
         value: false
+      - key: USE_VECTOR_RETRIEVER
+        value: false

@@ -1,4 +1,4 @@
-﻿import ast
+import ast
 import asyncio
 import re
 from pathlib import Path
@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 
 import faiss
 import pandas as pd
-from sentence_transformers import SentenceTransformer
 
 from app.config import get_settings
 from app.services.llm_service import get_llm_service
@@ -55,7 +54,6 @@ def _looks_hinglish(text: str) -> bool:
         "koi",
         "aisa",
         "aisi",
-        "aisa",
         "jaisa",
         "waise",
         "thoda",
@@ -81,18 +79,18 @@ def _detect_language_preference(query: str) -> str | None:
         "hindi film",
         "bollywood",
         "in hindi",
-        "हिंदी फिल्म",
-        "हिंदी मूवी",
-        "हिंदी में",
+        "????? ?????",
+        "????? ????",
+        "????? ???",
     ]
     english_tokens = [
         "english movie",
         "english film",
         "hollywood",
         "in english",
-        "अंग्रेजी फिल्म",
-        "अंग्रेज़ी फिल्म",
-        "अंग्रेजी में",
+        "???????? ?????",
+        "????????? ?????",
+        "???????? ???",
     ]
     for token in hindi_tokens:
         if _normalize_text(token) in q:
@@ -107,18 +105,45 @@ class VectorRetriever:
     def __init__(self) -> None:
         settings = get_settings()
         self.settings = settings
-        index_path = Path(settings.vector_index_path)
-        metadata_path = Path(settings.vector_metadata_path)
+        self.use_vector_retriever = bool(settings.use_vector_retriever)
 
-        if not index_path.exists():
-            raise FileNotFoundError(f"FAISS index not found: {index_path}")
+        metadata_path = Path(settings.vector_metadata_path)
         if not metadata_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-        self.index = faiss.read_index(str(index_path))
         self.df = pd.read_pickle(metadata_path).fillna("")
-        self.model = SentenceTransformer(settings.embedding_model_name or "all-MiniLM-L6-v2")
         self.llm = get_llm_service(settings)
+
+        self.index = None
+        self.model = None
+
+        if self.use_vector_retriever:
+            index_path = Path(settings.vector_index_path)
+            if index_path.exists():
+                try:
+                    self.index = faiss.read_index(str(index_path))
+                except Exception:
+                    self.use_vector_retriever = False
+                    self.index = None
+            else:
+                self.use_vector_retriever = False
+
+    def _ensure_model(self):
+        if not self.use_vector_retriever:
+            return None
+        if self.model is not None:
+            return self.model
+
+        try:
+            # Lazy import keeps free-tier memory stable until semantic retrieval is explicitly used.
+            from sentence_transformers import SentenceTransformer
+
+            self.model = SentenceTransformer(self.settings.embedding_model_name or "all-MiniLM-L6-v2")
+            return self.model
+        except Exception:
+            self.use_vector_retriever = False
+            self.model = None
+            return None
 
     async def _normalize_query_for_search(self, query: str) -> tuple[str, str | None]:
         raw = (query or "").strip()
@@ -170,6 +195,51 @@ class VectorRetriever:
             "popularity": float(record.get("popularity", 0.0) or 0.0),
         }
 
+    def _keyword_candidates(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        if self.df.empty:
+            return []
+
+        q = _normalize_text(query)
+        tokens = [t for t in q.split() if len(t) > 2]
+
+        if not tokens:
+            ranked = self.df.sort_values(by="popularity", ascending=False).head(top_k)
+            return [self._normalize_movie_record(r) for r in ranked.to_dict(orient="records")]
+
+        scored: list[tuple[float, float, int]] = []
+        for idx, row in enumerate(self.df.itertuples(index=False)):
+            title = str(getattr(row, "title", "")).strip()
+            overview = str(getattr(row, "overview", "")).strip()
+            genres = " ".join(_safe_list(getattr(row, "genres", [])))
+            actors = " ".join(_safe_list(getattr(row, "top_actors", [])))
+            director = str(getattr(row, "director", "")).strip()
+            popularity = float(getattr(row, "popularity", 0.0) or 0.0)
+
+            title_l = title.lower()
+            genres_l = genres.lower()
+            blob = f"{title} {overview} {genres} {actors} {director}".lower()
+
+            score = 0.0
+            for token in tokens:
+                if token in title_l:
+                    score += 3.0
+                elif token in genres_l:
+                    score += 2.0
+                elif token in blob:
+                    score += 1.0
+
+            if score > 0:
+                scored.append((score, popularity, idx))
+
+        if not scored:
+            ranked = self.df.sort_values(by="popularity", ascending=False).head(top_k)
+            return [self._normalize_movie_record(r) for r in ranked.to_dict(orient="records")]
+
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        picks = [idx for _, _, idx in scored[:top_k]]
+        ranked = self.df.iloc[picks]
+        return [self._normalize_movie_record(r) for r in ranked.to_dict(orient="records")]
+
     async def search_movies(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
         query = (query or "").strip()
         if not query:
@@ -177,13 +247,22 @@ class VectorRetriever:
 
         top_k = max(1, min(int(top_k), len(self.df)))
 
+        if not self.use_vector_retriever or self.index is None:
+            return await asyncio.to_thread(self._keyword_candidates, query, top_k)
+
         def _search_sync() -> List[Dict[str, Any]]:
-            query_embedding = self.model.encode([query]).astype("float32")
+            model = self._ensure_model()
+            if model is None or self.index is None:
+                return self._keyword_candidates(query, top_k)
+            query_embedding = model.encode([query]).astype("float32")
             _, indices = self.index.search(query_embedding, top_k)
             results = self.df.iloc[indices[0]].to_dict(orient="records")
             return [self._normalize_movie_record(r) for r in results]
 
-        return await asyncio.to_thread(_search_sync)
+        try:
+            return await asyncio.to_thread(_search_sync)
+        except Exception:
+            return await asyncio.to_thread(self._keyword_candidates, query, top_k)
 
     async def rerank_movies(
         self,
