@@ -286,12 +286,47 @@
       @media (max-width: 1050px) { .discover-grid { grid-template-columns: repeat(4, minmax(0,1fr)); } }
       @media (max-width: 860px) {
         .app { grid-template-columns: 1fr; }
-        .sidebar { border-right: none; border-bottom: 1px solid var(--line); }
-        .tabs { grid-template-columns: 1fr 1fr; }
+        .sidebar {
+          border-right: none;
+          border-bottom: 1px solid var(--line);
+          padding: 10px 12px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+        }
+        .brand-wrap { margin-bottom: 0; gap: 0; }
+        .brand { font-size: 1.85rem; }
+        .brand-tagline { font-size: 0.58rem; letter-spacing: 0.12em; }
+        .tabs {
+          display: flex;
+          gap: 8px;
+          margin-left: auto;
+          max-width: 260px;
+          width: 100%;
+        }
+        .tab-btn {
+          flex: 1 1 0;
+          justify-content: center;
+          padding: 8px 10px;
+          font-size: 1rem;
+        }
+        .main { padding: 12px; }
         .discover-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
         .movie-tile { flex: 0 0 180px; min-width: 180px; }
       }
       @media (max-width: 620px) {
+        .sidebar {
+          flex-wrap: wrap;
+          align-items: flex-start;
+          padding: 10px;
+        }
+        .brand { font-size: 1.7rem; }
+        .tabs {
+          margin-left: 0;
+          max-width: none;
+          width: 100%;
+        }
         .search-wrap { grid-template-columns: 1fr auto auto auto; }
         .query { font-size: 1rem; padding: 12px; }
         .mic-btn { width: 82px; height: 46px; }

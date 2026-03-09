@@ -127,6 +127,26 @@ let audioPrimed = false;
 let topMoviePool = [];
 let topMovieRotateTimer = null;
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const fetchJsonWithRetry = async (url, options = {}, retries = 3, baseDelayMs = 700) => {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return await res.json();
+    } catch (err) {
+      lastError = err;
+      if (attempt >= retries) break;
+      await sleep(baseDelayMs * (attempt + 1));
+    }
+  }
+  throw lastError || new Error("Request failed");
+};
+
 const setStatus = (text) => {
   statusEl.textContent = text;
 };
@@ -151,7 +171,10 @@ const safePosterUrl = (url) => {
   const raw = String(url || "").trim();
   if (!raw) return "";
   try {
-    const parsed = new URL(raw, window.location.origin);
+    let normalized = raw;
+    if (normalized.startsWith("//")) normalized = `https:${normalized}`;
+    if (/^http:\/\//i.test(normalized)) normalized = normalized.replace(/^http:\/\//i, "https://");
+    const parsed = new URL(normalized, window.location.origin);
     if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.href;
   } catch (_) {
     return "";
@@ -254,9 +277,7 @@ const setLoading = (on, message = "Idle") => {
 
 const loadPosterWall = async () => {
   try {
-    const res = await fetch("/poster-wall?count=50");
-    if (!res.ok) return;
-    const data = await res.json();
+    const data = await fetchJsonWithRetry("/poster-wall?count=50", {}, 2, 600);
     const posters = data.posters || [];
     posterTrack.innerHTML = "";
     if (!posters.length) return;
@@ -281,18 +302,19 @@ const loadPosterWall = async () => {
 const loadTopMovies = async (genre = "") => {
   const qs = new URLSearchParams({ limit: String(TOP_POOL_LIMIT) });
   if (genre) qs.set("genre", genre);
-  const res = await fetch(`/top-movies?${qs.toString()}`);
-  if (!res.ok) throw new Error(`Top movies failed: ${res.status}`);
-  const data = await res.json();
-  topMoviePool = Array.isArray(data.movies) ? data.movies : [];
+  let data = null;
+  try {
+    data = await fetchJsonWithRetry(`/top-movies?${qs.toString()}`, {}, 3, 800);
+  } catch (_) {
+    data = await fetchJsonWithRetry(`/discover-movies?limit=${TOP_POOL_LIMIT}`, {}, 2, 900);
+  }
+  topMoviePool = Array.isArray(data?.movies) ? data.movies : [];
   renderTopMovieSubset();
   startTopMovieRotation();
 };
 
 const loadDiscoverMovies = async () => {
-  const res = await fetch("/discover-movies?limit=50");
-  if (!res.ok) throw new Error(`Discover failed: ${res.status}`);
-  const data = await res.json();
+  const data = await fetchJsonWithRetry("/discover-movies?limit=50", {}, 3, 800);
   renderMovieRow(discoverGrid, data.movies || []);
 };
 
