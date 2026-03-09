@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: movie-assistant-api
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SESSION_JWT_SECRET
+        generateValue: true
+      - key: WEB_CONCURRENCY
+        value: 1
+      - key: ALLOWED_HOSTS
+        value: localhost,127.0.0.1,movie-assistant-api.onrender.com
+      - key: USE_FINE_TUNED
+        value: false
