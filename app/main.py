@@ -634,6 +634,12 @@ async def ws_voice(websocket: WebSocket) -> None:
 
             if msg_type == "start_session":
                 candidate_token = str(payload.get("session_token", "")).strip()
+                silent_resume = payload.get("silent", False) is True or str(payload.get("silent", "")).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
                 if candidate_token:
                     try:
                         state = services.session_tokens.decode(candidate_token)
@@ -655,6 +661,9 @@ async def ws_voice(websocket: WebSocket) -> None:
                         "text": greeting_text,
                     },
                 )
+
+                if silent_resume and candidate_token:
+                    continue
 
                 await cancel_active_turn()
                 active_cancel_event = asyncio.Event()

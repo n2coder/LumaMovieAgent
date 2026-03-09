@@ -20,46 +20,46 @@ const PAGE_API_KEY = new URLSearchParams(window.location.search).get("api_key") 
 
 const PLATFORM_VAD_CONFIG = {
   desktop: {
-    silenceMs: 700,
-    vadIntervalMs: 120,
-    bargeHoldMs: 85,
-    bargeStrongHoldMs: 150,
-    bargeMinAudioMs: 180,
-    energyBase: 0.0032,
+    silenceMs: 950,
+    vadIntervalMs: 100,
+    bargeHoldMs: 70,
+    bargeStrongHoldMs: 120,
+    bargeMinAudioMs: 120,
+    energyBase: 0.0018,
     calibrationMs: 700,
-    calibrationMultiplier: 1.3,
-    echoSuppressMs: 320,
-    bargeDynamicMultiplier: 1.2,
-    bargeAssistantFloorMultiplier: 1.35,
-    bargeStrongMultiplier: 1.08,
+    calibrationMultiplier: 1.12,
+    echoSuppressMs: 260,
+    bargeDynamicMultiplier: 1.04,
+    bargeAssistantFloorMultiplier: 1.16,
+    bargeStrongMultiplier: 1.03,
   },
   android: {
-    silenceMs: 820,
-    vadIntervalMs: 110,
-    bargeHoldMs: 95,
-    bargeStrongHoldMs: 170,
-    bargeMinAudioMs: 220,
-    energyBase: 0.0028,
+    silenceMs: 1050,
+    vadIntervalMs: 100,
+    bargeHoldMs: 78,
+    bargeStrongHoldMs: 130,
+    bargeMinAudioMs: 140,
+    energyBase: 0.0016,
     calibrationMs: 900,
-    calibrationMultiplier: 1.45,
-    echoSuppressMs: 380,
-    bargeDynamicMultiplier: 1.28,
-    bargeAssistantFloorMultiplier: 1.42,
-    bargeStrongMultiplier: 1.1,
+    calibrationMultiplier: 1.15,
+    echoSuppressMs: 300,
+    bargeDynamicMultiplier: 1.05,
+    bargeAssistantFloorMultiplier: 1.18,
+    bargeStrongMultiplier: 1.04,
   },
   ios: {
-    silenceMs: 900,
-    vadIntervalMs: 110,
-    bargeHoldMs: 105,
-    bargeStrongHoldMs: 190,
-    bargeMinAudioMs: 260,
-    energyBase: 0.0024,
+    silenceMs: 1100,
+    vadIntervalMs: 100,
+    bargeHoldMs: 82,
+    bargeStrongHoldMs: 140,
+    bargeMinAudioMs: 150,
+    energyBase: 0.0015,
     calibrationMs: 1000,
-    calibrationMultiplier: 1.55,
-    echoSuppressMs: 460,
-    bargeDynamicMultiplier: 1.35,
-    bargeAssistantFloorMultiplier: 1.5,
-    bargeStrongMultiplier: 1.12,
+    calibrationMultiplier: 1.18,
+    echoSuppressMs: 320,
+    bargeDynamicMultiplier: 1.06,
+    bargeAssistantFloorMultiplier: 1.2,
+    bargeStrongMultiplier: 1.05,
   },
 };
 const MIC_IDLE_TIMEOUT_MS = 30000;
@@ -82,9 +82,21 @@ const detectVadProfile = () => {
 
 const VAD_PROFILE = detectVadProfile();
 const VAD = PLATFORM_VAD_CONFIG[VAD_PROFILE] || PLATFORM_VAD_CONFIG.desktop;
+const VAD_MAX_THRESHOLD_BY_PROFILE = {
+  desktop: 0.0044,
+  android: 0.0038,
+  ios: 0.0034,
+};
+const WS_PING_INTERVAL_MS = 15000;
+const WS_RECONNECT_BASE_MS = 900;
+const WS_RECONNECT_MAX_MS = 7000;
 
 let ws = null;
 let wsReady = false;
+let wsPingTimer = null;
+let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+let wsClosingIntentionally = false;
 let sessionId = null;
 let sessionToken = null;
 let awaitingTurn = false;
@@ -336,6 +348,43 @@ const sendWs = (payload) => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(JSON.stringify(payload));
   return true;
+};
+
+const stopWsHeartbeat = () => {
+  if (wsPingTimer) {
+    clearInterval(wsPingTimer);
+    wsPingTimer = null;
+  }
+};
+
+const startWsHeartbeat = () => {
+  stopWsHeartbeat();
+  wsPingTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    sendWs({ type: "ping" });
+  }, WS_PING_INTERVAL_MS);
+};
+
+const scheduleWsReconnect = () => {
+  if (!isVoiceMode || wsReconnectTimer) return;
+  const delay = Math.min(WS_RECONNECT_BASE_MS * 2 ** wsReconnectAttempts, WS_RECONNECT_MAX_MS);
+  wsReconnectTimer = setTimeout(async () => {
+    wsReconnectTimer = null;
+    wsReconnectAttempts += 1;
+    try {
+      setStatus("Reconnecting voice...");
+      await connectVoiceSocket();
+      wsReconnectAttempts = 0;
+      sendWs({
+        type: "start_session",
+        session_token: sessionToken || "",
+        silent: true,
+      });
+      setStatus("Listening...");
+    } catch (_) {
+      scheduleWsReconnect();
+    }
+  }, delay);
 };
 
 const clearAudioQueue = () => {
@@ -714,6 +763,11 @@ const handleWsMessage = (payload) => {
     awaitingTurn = false;
     updateConversation(undefined, `Error: ${payload.detail || "Unknown voice error"}`);
     setStatus("Error");
+    return;
+  }
+
+  if (type === "pong") {
+    markActivity();
   }
 };
 
@@ -727,7 +781,9 @@ const connectVoiceSocket = async () =>
 
     ws = new WebSocket(wsUrl());
     ws.onopen = () => {
+      wsClosingIntentionally = false;
       wsReady = true;
+      startWsHeartbeat();
       resolve();
     };
     ws.onerror = () => {
@@ -736,7 +792,11 @@ const connectVoiceSocket = async () =>
     };
     ws.onclose = () => {
       wsReady = false;
-      if (isVoiceMode) {
+      stopWsHeartbeat();
+      if (isVoiceMode && !wsClosingIntentionally) {
+        setStatus("Voice connection lost");
+        scheduleWsReconnect();
+      } else if (isVoiceMode) {
         setStatus("Voice connection closed");
       }
     };
@@ -750,6 +810,13 @@ const connectVoiceSocket = async () =>
   });
 
 const closeVoiceSocket = () => {
+  wsClosingIntentionally = true;
+  stopWsHeartbeat();
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  wsReconnectAttempts = 0;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.close(1000, "voice-stop");
   }
@@ -799,7 +866,8 @@ const calibrateAmbientNoise = async (ms = VAD.calibrationMs) => {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const ambient = samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
-  dynamicEnergyThreshold = Math.max(VAD.energyBase, ambient * VAD.calibrationMultiplier);
+  const maxCap = VAD_MAX_THRESHOLD_BY_PROFILE[VAD_PROFILE] || 0.0044;
+  dynamicEnergyThreshold = Math.min(maxCap, Math.max(VAD.energyBase, ambient * VAD.calibrationMultiplier));
 };
 
 const setMicCaptureEnabled = (enabled) => {
@@ -843,14 +911,22 @@ const startSpeechRecognition = () => {
     lastDetectedLangHint = detectedHint;
     if (currentAssistantSource === "greeting" && inTranscriptBlock) return;
     if (assistantSpeaking() && !allowTranscriptDuringPlayback) {
-      // Never accept transcript while assistant audio is active.
-      // Barge-in is handled by VAD logic only to prevent self-capture.
+      // During playback, allow a safe transcript-driven barge-in for quiet voices.
+      if (!inTranscriptBlock && !isLikelyAssistantEcho(text) && text.length >= 8) {
+        stopAssistantPlayback(true);
+        pendingTranscript = text;
+        lastSpeechAt = Date.now();
+        updateConversation(text, undefined);
+      }
       return;
     }
     if (inTranscriptBlock) return;
 
     pendingTranscript = text;
     if (isLikelyAssistantEcho(pendingTranscript)) return;
+    if (dynamicEnergyThreshold > VAD.energyBase * 1.1) {
+      dynamicEnergyThreshold = Math.max(VAD.energyBase, dynamicEnergyThreshold * 0.93);
+    }
     lastSpeechAt = Date.now();
     updateConversation(text, undefined);
     markActivity();
@@ -978,6 +1054,7 @@ const startVoiceMode = async () => {
   await primeAudioPlayback();
 
   await connectVoiceSocket();
+  wsReconnectAttempts = 0;
 
   isVoiceMode = true;
   isMicMuted = false;
