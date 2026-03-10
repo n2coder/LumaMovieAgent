@@ -33,6 +33,7 @@ from app.services.llm_service import (
     is_recommendation_intent,
     is_small_talk_query,
     policy_response_for_query,
+    resolve_recommendation_query,
 )
 from app.services.retriever import Retriever
 from app.services.runtime import AppServices
@@ -240,7 +241,7 @@ def _build_stream_messages(
         f"Candidate movies:\n{chr(10).join(movie_lines)}\n\n"
         f"{language_rule}\n"
         "Start with one short opening line. "
-        "Recommend exactly two movies from the candidates. "
+        "Recommend exactly three movies from the candidates. "
         "Give one short sentence per movie. "
         "End with one short follow-up question. "
         "No markdown. No bullets."
@@ -437,6 +438,7 @@ async def _process_voice_turn(
     full_text = ""
     end_session = False
     should_stream_llm = False
+    resolved_query = user_query
 
     if _is_kill_phrase(user_query):
         end_session = True
@@ -469,7 +471,8 @@ async def _process_voice_turn(
                     output_language=user_lang,
                 )
             else:
-                retrieved = await services.retriever.retrieve(user_query, top_k=services.settings.top_k)
+                resolved_query = resolve_recommendation_query(user_query, state.history)
+                retrieved = await services.retriever.retrieve(resolved_query, top_k=services.settings.top_k)
                 movies = [m.as_dict() for m in retrieved]
                 if movies:
                     await _send_json_locked(
@@ -484,7 +487,7 @@ async def _process_voice_turn(
                 if not should_stream_llm:
                     full_text = await generate_grounded_recommendation_text(
                         llm=services.llm,
-                        query=user_query,
+                        query=resolved_query,
                         movies=movies,
                         history=state.history,
                         output_language=user_lang,
@@ -493,7 +496,7 @@ async def _process_voice_turn(
     if should_stream_llm:
         messages = _build_stream_messages(
             state.history,
-            user_query,
+            resolved_query,
             movies,
             output_language=user_lang,
         )
@@ -564,7 +567,7 @@ async def _process_voice_turn(
         if not full_text and not cancel_event.is_set():
             full_text = await generate_grounded_recommendation_text(
                 llm=services.llm,
-                query=user_query,
+                query=resolved_query,
                 movies=movies,
                 history=state.history,
                 output_language=user_lang,

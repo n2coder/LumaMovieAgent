@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     top_k: int = 5
     use_vector_retriever: bool = True
     enable_webrtc_audio: bool = True
-    enable_silero_vad: bool = True
+    enable_silero_vad: bool = False
     silero_vad_threshold: float = 0.56
     silero_vad_min_speech_ms: int = 120
     silero_vad_hangover_ms: int = 450

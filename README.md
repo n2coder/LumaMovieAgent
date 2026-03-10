@@ -85,6 +85,12 @@ Response:
 pip install -r requirements.txt
 ```
 
+Optional higher-accuracy server VAD (larger memory/runtime footprint):
+
+```bash
+pip install -r requirements-voice-ml.txt
+```
+
 3. Run:
 
 ```bash
@@ -107,6 +113,8 @@ docker run --env-file .env -p 8000:8000 movie-assistant
 - Set `OPENAI_API_KEY` in Render dashboard (not in repo)
 - Keep `WEB_CONCURRENCY=1` on free/low-memory instances
 - Set `USE_VECTOR_RETRIEVER=false` on free instances to avoid loading heavy transformer runtime
+- Keep `ENABLE_SILERO_VAD=false` on free instances (default) for lightweight deployment
+- Only enable Silero VAD after installing `requirements-voice-ml.txt` on higher-memory plans
 
 ## Security Notes
 

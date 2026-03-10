@@ -27,6 +27,9 @@ class WebRtcPeer:
     vad_stream: SileroStreamState | None = None
     vad_state: bool = False
     last_vad_emit: float = 0.0
+    energy_floor: float = 0.0025
+    energy_speech_ms: float = 0.0
+    energy_silence_ms: float = 0.0
 
 
 class WebRtcBridge:
@@ -68,14 +71,15 @@ class WebRtcBridge:
 
             # Frontend can immediately know server-side VAD is wired.
             try:
+                source = "silero" if self._vad.is_ready() else "energy"
                 channel.send(
                     json.dumps(
                         {
                             "type": "vad_state",
                             "speech": False,
                             "score": 0.0,
-                            "source": "silero",
-                            "enabled": self._vad.is_ready(),
+                            "source": source,
+                            "enabled": True,
                         }
                     )
                 )
@@ -145,22 +149,58 @@ class WebRtcBridge:
             return False
 
     async def _process_vad_frame(self, peer: WebRtcPeer, frame: Any) -> None:
-        if not self._vad.is_ready():
-            return
-        if peer.vad_stream is None:
-            peer.vad_stream = self._vad.new_stream()
         samples, sample_rate = self._frame_to_mono_float32(frame)
         if samples.size == 0:
             return
 
-        speaking, score, changed = self._vad.process_chunk(peer.vad_stream, samples, sample_rate)
+        if self._vad.is_ready():
+            if peer.vad_stream is None:
+                peer.vad_stream = self._vad.new_stream()
+            speaking, score, changed = self._vad.process_chunk(peer.vad_stream, samples, sample_rate)
+            source = "silero"
+        else:
+            speaking, score, changed = self._process_energy_vad(peer, samples, sample_rate)
+            source = "energy"
+
         now = time.time()
         emit_interval = 0.22
         should_emit = changed or (speaking and now - peer.last_vad_emit >= emit_interval)
         if should_emit:
-            await self._send_vad_state(peer, speaking=speaking, score=score)
+            await self._send_vad_state(peer, speaking=speaking, score=score, source=source)
 
-    async def _send_vad_state(self, peer: WebRtcPeer, speaking: bool, score: float) -> None:
+    def _process_energy_vad(self, peer: WebRtcPeer, samples: np.ndarray, sample_rate: int) -> tuple[bool, float, bool]:
+        if samples.size == 0:
+            return peer.vad_state, 0.0, False
+        duration_ms = (samples.shape[0] / float(sample_rate or 16000)) * 1000.0
+        rms = float(np.sqrt(np.mean(samples * samples)))
+
+        if not peer.vad_state:
+            peer.energy_floor = 0.95 * peer.energy_floor + 0.05 * rms
+        else:
+            peer.energy_floor = 0.985 * peer.energy_floor + 0.015 * rms
+
+        speech_threshold = max(0.0095, peer.energy_floor * 3.1)
+        release_threshold = max(0.006, peer.energy_floor * 2.0)
+        is_speech = rms >= speech_threshold if not peer.vad_state else rms >= release_threshold
+
+        if is_speech:
+            peer.energy_speech_ms += duration_ms
+            peer.energy_silence_ms = 0.0
+        else:
+            peer.energy_silence_ms += duration_ms
+            if not peer.vad_state:
+                peer.energy_speech_ms = 0.0
+
+        previous = peer.vad_state
+        if not peer.vad_state and peer.energy_speech_ms >= float(self._settings.silero_vad_min_speech_ms):
+            peer.vad_state = True
+        elif peer.vad_state and peer.energy_silence_ms >= float(self._settings.silero_vad_hangover_ms):
+            peer.vad_state = False
+            peer.energy_speech_ms = 0.0
+
+        return peer.vad_state, rms, previous != peer.vad_state
+
+    async def _send_vad_state(self, peer: WebRtcPeer, speaking: bool, score: float, source: str) -> None:
         channel = peer.audio_channel
         if not channel or getattr(channel, "readyState", "") != "open":
             peer.vad_state = speaking
@@ -170,7 +210,7 @@ class WebRtcBridge:
             "type": "vad_state",
             "speech": bool(speaking),
             "score": round(float(score), 4),
-            "source": "silero",
+            "source": source,
             "enabled": True,
         }
         try:
