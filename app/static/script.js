@@ -138,6 +138,7 @@ let audioQueue = [];
 let audioPrimed = false;
 let topMoviePool = [];
 let topMovieRotateTimer = null;
+let pendingSubmitTimer = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -348,6 +349,13 @@ const sendWs = (payload) => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(JSON.stringify(payload));
   return true;
+};
+
+const clearPendingSubmitTimer = () => {
+  if (pendingSubmitTimer) {
+    clearTimeout(pendingSubmitTimer);
+    pendingSubmitTimer = null;
+  }
 };
 
 const stopWsHeartbeat = () => {
@@ -753,9 +761,11 @@ const handleWsMessage = (payload) => {
 
   if (type === "barge_in_ack") {
     markActivity();
+    awaitingTurn = false;
     bargeRequested = false;
     updateConversation(undefined, interruptionPrompt());
     setStatus("Listening...");
+    if (pendingTranscript.trim()) schedulePendingTranscriptSubmit(320);
     return;
   }
 
@@ -784,6 +794,9 @@ const connectVoiceSocket = async () =>
       wsClosingIntentionally = false;
       wsReady = true;
       startWsHeartbeat();
+      if (pendingTranscript.trim() && !awaitingTurn && !isMicMuted) {
+        schedulePendingTranscriptSubmit(280);
+      }
       resolve();
     };
     ws.onerror = () => {
@@ -812,6 +825,7 @@ const connectVoiceSocket = async () =>
 const closeVoiceSocket = () => {
   wsClosingIntentionally = true;
   stopWsHeartbeat();
+  clearPendingSubmitTimer();
   if (wsReconnectTimer) {
     clearTimeout(wsReconnectTimer);
     wsReconnectTimer = null;
@@ -899,8 +913,10 @@ const startSpeechRecognition = () => {
 
   recog.onresult = (event) => {
     let interim = "";
+    let hasFinal = false;
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       interim += event.results[i][0].transcript || "";
+      if (event.results[i].isFinal) hasFinal = true;
     }
     const text = interim.trim();
     if (!text) return;
@@ -925,6 +941,11 @@ const startSpeechRecognition = () => {
     lastSpeechAt = Date.now();
     updateConversation(text, undefined);
     markActivity();
+    if (hasFinal) {
+      schedulePendingTranscriptSubmit(160);
+    } else {
+      schedulePendingTranscriptSubmit(880);
+    }
   };
 
   recog.onerror = () => {};
@@ -985,6 +1006,27 @@ const submitVoiceQuery = (query) => {
   return true;
 };
 
+const trySubmitPendingTranscript = () => {
+  const queued = pendingTranscript.trim();
+  if (!queued) return false;
+  if (assistantSpeaking() || awaitingTurn || isMicMuted) return false;
+  if (Date.now() < transcriptBlockUntil) return false;
+  if (submitVoiceQuery(queued)) {
+    pendingTranscript = "";
+    clearPendingSubmitTimer();
+    return true;
+  }
+  return false;
+};
+
+const schedulePendingTranscriptSubmit = (delayMs = 950) => {
+  clearPendingSubmitTimer();
+  pendingSubmitTimer = setTimeout(() => {
+    pendingSubmitTimer = null;
+    trySubmitPendingTranscript();
+  }, delayMs);
+};
+
 const processVadTick = () => {
   if (!isVoiceMode || isMicMuted || !analyser) return;
 
@@ -1039,10 +1081,16 @@ const processVadTick = () => {
     Date.now() >= transcriptBlockUntil &&
     Date.now() - lastSpeechAt >= VAD.silenceMs
   ) {
-    const query = pendingTranscript.trim();
-    if (submitVoiceQuery(query)) {
-      pendingTranscript = "";
-    }
+    trySubmitPendingTranscript();
+  } else if (
+    pendingTranscript.trim() &&
+    !assistantSpeaking() &&
+    !awaitingTurn &&
+    Date.now() >= transcriptBlockUntil &&
+    Date.now() - lastRecognitionResultAt >= 1200
+  ) {
+    // Safety net for cases where VAD silence transition is missed.
+    trySubmitPendingTranscript();
   }
 
   const idleFor = Date.now() - Math.max(lastSpeechAt || 0, lastActivityAt || 0);
@@ -1103,6 +1151,7 @@ const stopVoiceMode = () => {
   speakingSince = 0;
   clearInterval(monitorTimer);
   monitorTimer = null;
+  clearPendingSubmitTimer();
 
   stopAssistantPlayback(false);
   stopSpeechRecognition();
@@ -1216,10 +1265,7 @@ muteBtn.addEventListener("click", () => {
     startSpeechRecognition();
     setStatus(isVoiceMode ? "Listening..." : "Idle");
     if (isVoiceMode && pendingTranscript.trim() && !awaitingTurn) {
-      const queued = pendingTranscript.trim();
-      if (submitVoiceQuery(queued)) {
-        pendingTranscript = "";
-      }
+      schedulePendingTranscriptSubmit(180);
     }
   }
 });
