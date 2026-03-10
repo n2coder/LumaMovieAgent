@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     top_k: int = 5
     use_vector_retriever: bool = True
     enable_webrtc_audio: bool = True
+    enable_silero_vad: bool = True
+    silero_vad_threshold: float = 0.56
+    silero_vad_min_speech_ms: int = 120
+    silero_vad_hangover_ms: int = 450
+    silero_vad_sample_rate: int = 16000
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     vector_metadata_pkl: str = "app/data/movie_metadata.pkl"
     vector_index_bin: str = "app/data/faiss_index.bin"
