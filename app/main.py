@@ -531,7 +531,7 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["Permissions-Policy"] = "microphone=(self), geolocation=(), camera=()"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; img-src 'self' https: data:; media-src 'self' https: blob: data:; "
-        "script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' https: data:; "
         "connect-src 'self' ws: wss:; frame-ancestors 'none'"
     )
     if settings.is_production:
