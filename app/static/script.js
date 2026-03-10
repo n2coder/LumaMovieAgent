@@ -954,10 +954,19 @@ const startSpeechRecognition = () => {
 
 const submitVoiceQuery = (query) => {
   const clean = String(query || "").trim();
-  if (!clean || !wsReady || awaitingTurn) return;
-  if (Date.now() < transcriptBlockUntil) return;
-  if (isLikelyAssistantEcho(clean)) return;
-  if (!isMeaningfulAutoQuery(clean)) return;
+  if (!clean || awaitingTurn) return false;
+  if (Date.now() < transcriptBlockUntil) return false;
+  if (isLikelyAssistantEcho(clean)) return false;
+  if (!isMeaningfulAutoQuery(clean)) return false;
+  if (isMicMuted) {
+    setStatus("Mic muted - tap red mute to continue");
+    return false;
+  }
+  if (!wsReady) {
+    setStatus("Reconnecting voice...");
+    scheduleWsReconnect();
+    return false;
+  }
   awaitingTurn = true;
   allowTranscriptDuringPlayback = false;
   setStatus("Searching best movies...");
@@ -966,12 +975,19 @@ const submitVoiceQuery = (query) => {
   const recogLangHint = RECOGNITION_LANGS[recognitionLangIndex].startsWith("hi") ? "hi" : "en";
   const langHint = detectQueryLanguageHint(clean, lastDetectedLangHint || recogLangHint);
   recognitionLangIndex = langHint === "hi" ? 0 : 1;
-  sendWs({
+  const sent = sendWs({
     type: "user_query",
     query: clean,
     lang_hint: langHint,
     session_token: sessionToken || "",
   });
+  if (!sent) {
+    awaitingTurn = false;
+    setStatus("Reconnecting voice...");
+    scheduleWsReconnect();
+    return false;
+  }
+  return true;
 };
 
 const processVadTick = () => {
@@ -1029,8 +1045,9 @@ const processVadTick = () => {
     Date.now() - lastSpeechAt >= VAD.silenceMs
   ) {
     const query = pendingTranscript.trim();
-    pendingTranscript = "";
-    submitVoiceQuery(query);
+    if (submitVoiceQuery(query)) {
+      pendingTranscript = "";
+    }
   }
 
   const idleFor = Date.now() - Math.max(lastSpeechAt || 0, lastActivityAt || 0);
@@ -1118,7 +1135,14 @@ const postRecommend = async () => {
   const query = queryInput.value.trim();
   if (!query) return;
 
-  if (isVoiceMode && wsReady) {
+  if (isVoiceMode) {
+    if (isMicMuted) {
+      isMicMuted = false;
+      muteBtn.classList.remove("active");
+      setMicCaptureEnabled(true);
+      startSpeechRecognition();
+      setStatus("Listening...");
+    }
     submitVoiceQuery(query);
     return;
   }
@@ -1192,10 +1216,16 @@ muteBtn.addEventListener("click", () => {
   setMicCaptureEnabled(!isMicMuted);
   if (isMicMuted) {
     stopSpeechRecognition();
-    setStatus("Mic muted");
+    setStatus("Mic muted - tap red mute to continue");
   } else {
     startSpeechRecognition();
     setStatus(isVoiceMode ? "Listening..." : "Idle");
+    if (isVoiceMode && pendingTranscript.trim() && !awaitingTurn) {
+      const queued = pendingTranscript.trim();
+      if (submitVoiceQuery(queued)) {
+        pendingTranscript = "";
+      }
+    }
   }
 });
 
