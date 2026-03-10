@@ -911,13 +911,8 @@ const startSpeechRecognition = () => {
     lastDetectedLangHint = detectedHint;
     if (currentAssistantSource === "greeting" && inTranscriptBlock) return;
     if (assistantSpeaking() && !allowTranscriptDuringPlayback) {
-      // During playback, allow a safe transcript-driven barge-in for quiet voices.
-      if (!inTranscriptBlock && !isLikelyAssistantEcho(text) && text.length >= 8) {
-        stopAssistantPlayback(true);
-        pendingTranscript = text;
-        lastSpeechAt = Date.now();
-        updateConversation(text, undefined);
-      }
+      // Never accept recognizer transcript while assistant audio is active.
+      // Barge-in is handled by VAD stop logic, then transcript capture resumes.
       return;
     }
     if (inTranscriptBlock) return;
