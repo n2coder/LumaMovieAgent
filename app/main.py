@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.config import get_settings
@@ -38,6 +39,7 @@ from app.services.runtime import AppServices
 from app.services.session_token import SessionTokenManager
 from app.services.stt_service import STTService
 from app.services.tts_service import TTSService
+from app.services.webrtc_bridge import get_webrtc_bridge
 
 
 @asynccontextmanager
@@ -68,6 +70,7 @@ async def lifespan(app: FastAPI):
 
 
 settings = get_settings()
+webrtc_bridge = get_webrtc_bridge()
 WS_KILL_PHRASES = ("no thank you",)
 WS_END_SESSION_TEXT = "Okay, no problem. Catch you later."
 SENTENCE_BOUNDARY = re.compile(r"[.!?\u0964](?:['\"\)\]]*)\s*")
@@ -258,6 +261,19 @@ async def _send_json_locked(websocket: WebSocket, lock: asyncio.Lock, payload: d
         await websocket.send_json(payload)
 
 
+async def _send_audio_payload(
+    websocket: WebSocket,
+    send_lock: asyncio.Lock,
+    peer_id: str | None,
+    payload: dict,
+) -> None:
+    if settings.enable_webrtc_audio and peer_id:
+        sent = await webrtc_bridge.send_audio_chunk(peer_id, payload)
+        if sent:
+            return
+    await _send_json_locked(websocket, send_lock, payload)
+
+
 async def _tts_sentence_to_b64(services: AppServices, sentence: str) -> str | None:
     text = (sentence or "").strip()
     if not text:
@@ -325,6 +341,7 @@ async def _tts_worker(
     services: AppServices,
     sentence_queue: asyncio.Queue,
     cancel_event: asyncio.Event,
+    peer_id: str | None = None,
 ) -> None:
     index = 0
     while True:
@@ -336,9 +353,10 @@ async def _tts_worker(
                 continue
             audio_b64 = await _tts_sentence_to_b64(services, str(sentence))
             if audio_b64 and not cancel_event.is_set():
-                await _send_json_locked(
+                await _send_audio_payload(
                     websocket,
                     send_lock,
+                    peer_id,
                     {
                         "type": "audio_chunk",
                         "index": index,
@@ -357,6 +375,7 @@ async def _send_text_with_chunked_tts(
     services: AppServices,
     text: str,
     cancel_event: asyncio.Event,
+    peer_id: str | None = None,
 ) -> str:
     normalized = (text or "").strip()
     if not normalized:
@@ -368,9 +387,10 @@ async def _send_text_with_chunked_tts(
             break
         audio_b64 = await _tts_sentence_to_b64(services, sentence)
         if audio_b64 and not cancel_event.is_set():
-            await _send_json_locked(
+            await _send_audio_payload(
                 websocket,
                 send_lock,
+                peer_id,
                 {
                     "type": "audio_chunk",
                     "index": idx,
@@ -389,6 +409,7 @@ async def _process_voice_turn(
     query: str,
     cancel_event: asyncio.Event,
     lang_hint: str | None = None,
+    peer_id: str | None = None,
 ) -> str:
     try:
         state = services.session_tokens.decode(session_token)
@@ -477,7 +498,16 @@ async def _process_voice_turn(
             output_language=user_lang,
         )
         sentence_queue: asyncio.Queue = asyncio.Queue()
-        tts_task = asyncio.create_task(_tts_worker(websocket, send_lock, services, sentence_queue, cancel_event))
+        tts_task = asyncio.create_task(
+            _tts_worker(
+                websocket=websocket,
+                send_lock=send_lock,
+                services=services,
+                sentence_queue=sentence_queue,
+                cancel_event=cancel_event,
+                peer_id=peer_id,
+            )
+        )
         buffer = ""
         streamed_text = ""
         tts_parts: list[str] = []
@@ -539,9 +569,23 @@ async def _process_voice_turn(
                 history=state.history,
                 output_language=user_lang,
             )
-            await _send_text_with_chunked_tts(websocket, send_lock, services, full_text, cancel_event)
+            await _send_text_with_chunked_tts(
+                websocket,
+                send_lock,
+                services,
+                full_text,
+                cancel_event,
+                peer_id=peer_id,
+            )
     else:
-        full_text = await _send_text_with_chunked_tts(websocket, send_lock, services, full_text, cancel_event)
+        full_text = await _send_text_with_chunked_tts(
+            websocket,
+            send_lock,
+            services,
+            full_text,
+            cancel_event,
+            peer_id=peer_id,
+        )
 
     if cancel_event.is_set():
         await _send_json_locked(websocket, send_lock, {"type": "turn_cancelled"})
@@ -616,8 +660,9 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
     path = request.url.path
     method = request.method.upper()
 
-    protected_paths = {"/recommend", "/voice-chat", "/start-voice-session"}
-    if settings.app_api_key and path in protected_paths:
+    protected_paths = {"/recommend", "/voice-chat", "/start-voice-session", "/webrtc/offer"}
+    is_webrtc_close_path = path.startswith("/webrtc/close/")
+    if settings.app_api_key and (path in protected_paths or is_webrtc_close_path):
         provided = request.headers.get("X-API-Key", "").strip()
         same_origin = _is_same_origin_request(request)
         if not same_origin and provided != settings.app_api_key:
@@ -660,6 +705,24 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+class WebRTCOfferRequest(BaseModel):
+    sdp: str
+    type: str
+
+
+@app.post("/webrtc/offer")
+async def webrtc_offer(payload: WebRTCOfferRequest) -> dict:
+    if not settings.enable_webrtc_audio:
+        raise HTTPException(status_code=503, detail="WebRTC audio is disabled.")
+    return await webrtc_bridge.create_answer(sdp=payload.sdp, type_=payload.type)
+
+
+@app.post("/webrtc/close/{peer_id}")
+async def webrtc_close(peer_id: str) -> dict:
+    await webrtc_bridge.close_peer(peer_id)
+    return {"status": "closed"}
+
+
 @app.websocket("/ws/voice")
 async def ws_voice(websocket: WebSocket) -> None:
     if settings.app_api_key:
@@ -675,6 +738,7 @@ async def ws_voice(websocket: WebSocket) -> None:
     client_ip = websocket.client.host if websocket.client else "unknown"
 
     current_session_token = ""
+    current_peer_id = ""
     active_turn_task: asyncio.Task | None = None
     active_cancel_event = asyncio.Event()
 
@@ -706,6 +770,9 @@ async def ws_voice(websocket: WebSocket) -> None:
 
             if msg_type == "start_session":
                 candidate_token = str(payload.get("session_token", "")).strip()
+                peer_from_client = str(payload.get("peer_id", "")).strip()
+                if peer_from_client:
+                    current_peer_id = peer_from_client
                 silent_resume = payload.get("silent", False) is True or str(payload.get("silent", "")).strip().lower() in {
                     "1",
                     "true",
@@ -749,6 +816,7 @@ async def ws_voice(websocket: WebSocket) -> None:
                         services=services,
                         text=greeting_text,
                         cancel_event=active_cancel_event,
+                        peer_id=current_peer_id,
                     )
                     if active_cancel_event.is_set():
                         await _send_json_locked(websocket, send_lock, {"type": "turn_cancelled"})
@@ -771,6 +839,9 @@ async def ws_voice(websocket: WebSocket) -> None:
             elif msg_type == "user_query":
                 query = str(payload.get("query", "")).strip()
                 lang_hint = str(payload.get("lang_hint", "")).strip().lower()
+                peer_from_client = str(payload.get("peer_id", "")).strip()
+                if peer_from_client:
+                    current_peer_id = peer_from_client
                 token_from_client = str(payload.get("session_token", "")).strip()
                 if token_from_client:
                     current_session_token = token_from_client
@@ -811,6 +882,7 @@ async def ws_voice(websocket: WebSocket) -> None:
                         query=query,
                         cancel_event=active_cancel_event,
                         lang_hint=lang_hint,
+                        peer_id=current_peer_id,
                     )
                     current_session_token = new_token
 

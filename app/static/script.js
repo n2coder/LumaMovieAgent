@@ -90,6 +90,7 @@ const VAD_MAX_THRESHOLD_BY_PROFILE = {
 const WS_PING_INTERVAL_MS = 15000;
 const WS_RECONNECT_BASE_MS = 900;
 const WS_RECONNECT_MAX_MS = 7000;
+const WEBRTC_OFFER_TIMEOUT_MS = 12000;
 
 let ws = null;
 let wsReady = false;
@@ -97,6 +98,10 @@ let wsPingTimer = null;
 let wsReconnectTimer = null;
 let wsReconnectAttempts = 0;
 let wsClosingIntentionally = false;
+let rtcPeer = null;
+let rtcPeerId = "";
+let rtcDataChannel = null;
+let rtcReady = false;
 let sessionId = null;
 let sessionToken = null;
 let awaitingTurn = false;
@@ -364,6 +369,159 @@ const sendWs = (payload) => {
   return true;
 };
 
+const handleAudioChunkPayload = (payload) => {
+  markActivity();
+  gotAudioThisTurn = true;
+  const sentence = String(payload?.sentence || "").trim();
+  if (sentence) {
+    assistantDisplayText = `${assistantDisplayText}${assistantDisplayText ? "\n\n" : ""}${sentence}`.trim();
+    updateConversation(undefined, assistantDisplayText);
+  }
+  enqueueAudioChunk(payload?.audio_b64 || "");
+};
+
+const closeWebRtcPeer = async () => {
+  if (rtcDataChannel) {
+    try {
+      rtcDataChannel.close();
+    } catch (_) {
+      // ignore close race
+    }
+  }
+  rtcDataChannel = null;
+  if (rtcPeer) {
+    try {
+      rtcPeer.close();
+    } catch (_) {
+      // ignore close race
+    }
+  }
+  rtcPeer = null;
+  rtcReady = false;
+  const oldPeerId = rtcPeerId;
+  rtcPeerId = "";
+  if (oldPeerId) {
+    try {
+      await fetch(`/webrtc/close/${encodeURIComponent(oldPeerId)}`, {
+        method: "POST",
+        headers: withAuthHeaders(),
+      });
+    } catch (_) {
+      // best effort close only
+    }
+  }
+};
+
+const connectWebRtcPeer = async () => {
+  if (!stream) return;
+  if (rtcPeer && ["connected", "connecting"].includes(rtcPeer.connectionState || "")) return;
+
+  if (rtcPeer) {
+    await closeWebRtcPeer();
+  }
+
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+  });
+  rtcPeer = pc;
+  rtcReady = false;
+
+  rtcDataChannel = pc.createDataChannel("audio_downlink");
+  rtcDataChannel.onopen = () => {
+    rtcReady = true;
+  };
+  rtcDataChannel.onclose = () => {
+    rtcReady = false;
+  };
+  rtcDataChannel.onerror = () => {
+    rtcReady = false;
+  };
+  rtcDataChannel.onmessage = (event) => {
+    try {
+      const payload = JSON.parse(String(event.data || ""));
+      if (payload?.type === "audio_chunk") {
+        handleAudioChunkPayload(payload);
+      }
+    } catch (_) {
+      // ignore malformed datachannel payload
+    }
+  };
+
+  stream.getAudioTracks().forEach((track) => {
+    try {
+      pc.addTrack(track, stream);
+    } catch (_) {
+      // ignore duplicate track errors
+    }
+  });
+
+  pc.onconnectionstatechange = () => {
+    const state = pc.connectionState;
+    if (state === "connected") {
+      rtcReady = true;
+      return;
+    }
+    if (state === "disconnected" || state === "failed" || state === "closed") {
+      rtcReady = false;
+    }
+  };
+
+  const offer = await pc.createOffer({ offerToReceiveAudio: true });
+  await pc.setLocalDescription(offer);
+
+  if (pc.iceGatheringState !== "complete") {
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        pc.removeEventListener("icegatheringstatechange", onState);
+        resolve();
+      }, 1500);
+      const onState = () => {
+        if (pc.iceGatheringState === "complete") {
+          clearTimeout(timeout);
+          pc.removeEventListener("icegatheringstatechange", onState);
+          resolve();
+        }
+      };
+      pc.addEventListener("icegatheringstatechange", onState);
+    });
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), WEBRTC_OFFER_TIMEOUT_MS);
+  let answerPayload;
+  try {
+    const res = await fetch("/webrtc/offer", {
+      method: "POST",
+      headers: withAuthHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        sdp: offer.sdp,
+        type: offer.type,
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`WebRTC offer failed: ${res.status}`);
+    }
+    answerPayload = await res.json();
+    if (!answerPayload?.sdp || !answerPayload?.type) {
+      throw new Error("WebRTC answer payload invalid");
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  rtcPeerId = String(answerPayload?.peer_id || "").trim();
+  try {
+    await pc.setRemoteDescription({
+      type: answerPayload.type,
+      sdp: answerPayload.sdp,
+    });
+  } catch (err) {
+    await closeWebRtcPeer();
+    throw err;
+  }
+};
+
 const clearPendingSubmitTimer = () => {
   if (pendingSubmitTimer) {
     clearTimeout(pendingSubmitTimer);
@@ -395,11 +553,22 @@ const scheduleWsReconnect = () => {
     try {
       setStatus("Reconnecting voice...");
       await connectVoiceSocket();
+      const peerState = rtcPeer?.connectionState || "";
+      const shouldReconnectPeer =
+        !rtcPeerId || !rtcPeer || ["failed", "disconnected", "closed"].includes(peerState);
+      if (shouldReconnectPeer) {
+        try {
+          await connectWebRtcPeer();
+        } catch (_) {
+          // keep voice alive on WebSocket fallback if WebRTC renegotiation fails
+        }
+      }
       wsReconnectAttempts = 0;
       sendWs({
         type: "start_session",
         session_token: sessionToken || "",
         silent: true,
+        peer_id: rtcPeerId || "",
       });
       setListeningStatus();
     } catch (_) {
@@ -729,14 +898,7 @@ const handleWsMessage = (payload) => {
   }
 
   if (type === "audio_chunk") {
-    markActivity();
-    gotAudioThisTurn = true;
-    const sentence = String(payload.sentence || "").trim();
-    if (sentence) {
-      assistantDisplayText = `${assistantDisplayText}${assistantDisplayText ? "\n\n" : ""}${sentence}`.trim();
-      updateConversation(undefined, assistantDisplayText);
-    }
-    enqueueAudioChunk(payload.audio_b64 || "");
+    handleAudioChunkPayload(payload);
     return;
   }
 
@@ -1016,6 +1178,7 @@ const submitVoiceQuery = (query) => {
     query: clean,
     lang_hint: langHint,
     session_token: sessionToken || "",
+    peer_id: rtcPeerId || "",
   });
   if (!sent) {
     awaitingTurn = false;
@@ -1124,18 +1287,34 @@ const processVadTick = () => {
 const startVoiceMode = async () => {
   if (isVoiceMode) return;
 
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-    },
-  });
-  await primeAudioPlayback();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    await primeAudioPlayback();
 
-  await connectVoiceSocket();
-  wsReconnectAttempts = 0;
+    try {
+      await connectWebRtcPeer();
+    } catch (_) {
+      // WebRTC is optional transport; continue using WebSocket audio if setup fails.
+    }
+
+    await connectVoiceSocket();
+    wsReconnectAttempts = 0;
+  } catch (err) {
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+    }
+    closeVoiceSocket();
+    closeWebRtcPeer().catch(() => {});
+    throw err;
+  }
 
   isVoiceMode = true;
   isMicMuted = false;
@@ -1163,7 +1342,7 @@ const startVoiceMode = async () => {
   await calibrateAmbientNoise();
   monitorTimer = setInterval(processVadTick, VAD.vadIntervalMs);
 
-  sendWs({ type: "start_session", session_token: sessionToken || "" });
+  sendWs({ type: "start_session", session_token: sessionToken || "", peer_id: rtcPeerId || "" });
 };
 
 const stopVoiceMode = () => {
@@ -1196,6 +1375,7 @@ const stopVoiceMode = () => {
   setStatus("Idle");
 
   closeVoiceSocket();
+  closeWebRtcPeer().catch(() => {});
 };
 
 const postRecommend = async () => {
