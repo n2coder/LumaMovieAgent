@@ -108,6 +108,55 @@ def _split_text_sentences(text: str) -> list[str]:
     return sentences
 
 
+def _coalesce_tts_chunks(parts: list[str], min_chars: int = 120, max_chars: int = 260) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ""
+
+    for part in parts:
+        text = (part or "").strip()
+        if not text:
+            continue
+
+        candidate = f"{current} {text}".strip() if current else text
+        if len(candidate) <= max_chars:
+            current = candidate
+            if len(current) >= min_chars:
+                flush()
+            continue
+
+        if current:
+            flush()
+
+        if len(text) <= max_chars:
+            current = text
+            if len(current) >= min_chars:
+                flush()
+            continue
+
+        # Hard split oversized sentence at nearest whitespace.
+        remaining = text
+        while len(remaining) > max_chars:
+            window = remaining[:max_chars]
+            cut = window.rfind(" ")
+            if cut < int(max_chars * 0.6):
+                cut = max_chars
+            chunks.append(remaining[:cut].strip())
+            remaining = remaining[cut:].lstrip()
+        if remaining:
+            current = remaining
+            if len(current) >= min_chars:
+                flush()
+
+    flush()
+    return chunks
+
+
 def _extract_origin_host(origin_value: str) -> str:
     raw = (origin_value or "").strip()
     if not raw:
@@ -313,7 +362,8 @@ async def _send_text_with_chunked_tts(
     if not normalized:
         return ""
     await _send_json_locked(websocket, send_lock, {"type": "text_delta", "delta": normalized})
-    for idx, sentence in enumerate(_split_text_sentences(normalized)):
+    units = _coalesce_tts_chunks(_split_text_sentences(normalized))
+    for idx, sentence in enumerate(units):
         if cancel_event.is_set():
             break
         audio_b64 = await _tts_sentence_to_b64(services, sentence)
@@ -430,7 +480,22 @@ async def _process_voice_turn(
         tts_task = asyncio.create_task(_tts_worker(websocket, send_lock, services, sentence_queue, cancel_event))
         buffer = ""
         streamed_text = ""
+        tts_parts: list[str] = []
+        tts_chars = 0
         last_emit_at = time.monotonic()
+
+        async def flush_tts_parts(force: bool = False) -> None:
+            nonlocal tts_parts, tts_chars
+            if not tts_parts:
+                return
+            if not force and tts_chars < 120:
+                return
+            units = _coalesce_tts_chunks(tts_parts)
+            for unit in units:
+                await sentence_queue.put(unit)
+            tts_parts = []
+            tts_chars = 0
+
         try:
             async for delta in _stream_llm_deltas(services, messages):
                 if cancel_event.is_set():
@@ -440,7 +505,10 @@ async def _process_voice_turn(
                 buffer += delta
                 ready, buffer = _split_completed_sentences(buffer)
                 for sentence in ready:
-                    await sentence_queue.put(sentence)
+                    tts_parts.append(sentence)
+                    tts_chars += len(sentence)
+                if ready:
+                    await flush_tts_parts(force=False)
                     last_emit_at = time.monotonic()
 
                 if not ready:
@@ -448,11 +516,15 @@ async def _process_voice_turn(
                     if len(buffer.strip()) >= 95 and now - last_emit_at >= 0.45:
                         early, buffer = _force_progressive_chunk(buffer)
                         if early:
-                            await sentence_queue.put(early)
+                            tts_parts.append(early)
+                            tts_chars += len(early)
+                            await flush_tts_parts(force=False)
                             last_emit_at = now
 
             if not cancel_event.is_set() and buffer.strip():
-                await sentence_queue.put(buffer.strip())
+                tts_parts.append(buffer.strip())
+                tts_chars += len(buffer.strip())
+            await flush_tts_parts(force=True)
         finally:
             await sentence_queue.put(None)
             await sentence_queue.join()

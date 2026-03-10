@@ -131,6 +131,7 @@ let transcriptBlockUntil = 0;
 let lastAssistantUtterance = "";
 let currentAssistantSource = "";
 let lastDetectedLangHint = "en";
+let lastTranscriptNorm = "";
 
 let isAudioPlaying = false;
 let activeAudioUrl = null;
@@ -162,6 +163,18 @@ const fetchJsonWithRetry = async (url, options = {}, retries = 3, baseDelayMs = 
 
 const setStatus = (text) => {
   statusEl.textContent = text;
+};
+
+const setListeningStatus = () => {
+  if (!isVoiceMode) {
+    setStatus("Idle");
+    return;
+  }
+  if (isMicMuted) {
+    setStatus("Mic muted - tap red mute to continue");
+    return;
+  }
+  setStatus("Listening...");
 };
 
 const markActivity = () => {
@@ -388,7 +401,7 @@ const scheduleWsReconnect = () => {
         session_token: sessionToken || "",
         silent: true,
       });
-      setStatus("Listening...");
+      setListeningStatus();
     } catch (_) {
       scheduleWsReconnect();
     }
@@ -602,7 +615,7 @@ const stopAssistantPlayback = (sendBargeIn = false) => {
 const playNextAudioChunk = async () => {
   if (isAudioPlaying || !audioQueue.length) {
     if (!audioQueue.length && isVoiceMode && !awaitingTurn) {
-      setStatus("Listening...");
+      setListeningStatus();
     }
     return;
   }
@@ -679,6 +692,7 @@ const handleWsMessage = (payload) => {
     assistantStreamText = "";
     assistantDisplayText = "";
     pendingTranscript = "";
+    lastTranscriptNorm = "";
     gotAudioThisTurn = false;
     bargeRequested = false;
     playbackInterimText = "";
@@ -737,6 +751,7 @@ const handleWsMessage = (payload) => {
     lastAssistantUtterance = String(payload.full_text || assistantDisplayText || assistantStreamText || "").trim();
     transcriptBlockUntil = Date.now() + (completedSource === "greeting" ? 520 : 180);
     pendingTranscript = "";
+    lastTranscriptNorm = "";
     playbackInterimText = "";
     playbackInterimAt = 0;
     currentAssistantSource = "";
@@ -746,7 +761,7 @@ const handleWsMessage = (payload) => {
       stopVoiceMode();
       return;
     }
-    if (!assistantSpeaking() && isVoiceMode) setStatus("Listening...");
+    if (!assistantSpeaking() && isVoiceMode) setListeningStatus();
     return;
   }
 
@@ -755,7 +770,7 @@ const handleWsMessage = (payload) => {
     awaitingTurn = false;
     bargeRequested = false;
     currentAssistantSource = "";
-    if (isVoiceMode) setStatus("Listening...");
+    if (isVoiceMode) setListeningStatus();
     return;
   }
 
@@ -764,7 +779,7 @@ const handleWsMessage = (payload) => {
     awaitingTurn = false;
     bargeRequested = false;
     updateConversation(undefined, interruptionPrompt());
-    setStatus("Listening...");
+    setListeningStatus();
     if (pendingTranscript.trim()) schedulePendingTranscriptSubmit(320);
     return;
   }
@@ -935,6 +950,11 @@ const startSpeechRecognition = () => {
 
     pendingTranscript = text;
     if (isLikelyAssistantEcho(pendingTranscript)) return;
+    const normalizedTranscript = normalizeText(pendingTranscript);
+    const transcriptChanged = normalizedTranscript && normalizedTranscript !== lastTranscriptNorm;
+    if (transcriptChanged) {
+      lastTranscriptNorm = normalizedTranscript;
+    }
     if (dynamicEnergyThreshold > VAD.energyBase * 1.1) {
       dynamicEnergyThreshold = Math.max(VAD.energyBase, dynamicEnergyThreshold * 0.93);
     }
@@ -943,7 +963,7 @@ const startSpeechRecognition = () => {
     markActivity();
     if (hasFinal) {
       schedulePendingTranscriptSubmit(160);
-    } else {
+    } else if (transcriptChanged) {
       schedulePendingTranscriptSubmit(880);
     }
   };
@@ -1013,6 +1033,7 @@ const trySubmitPendingTranscript = () => {
   if (Date.now() < transcriptBlockUntil) return false;
   if (submitVoiceQuery(queued)) {
     pendingTranscript = "";
+    lastTranscriptNorm = "";
     clearPendingSubmitTimer();
     return true;
   }
@@ -1063,7 +1084,7 @@ const processVadTick = () => {
         speakingSince = 0;
         playbackInterimText = "";
         playbackInterimAt = 0;
-        setStatus("Listening...");
+        setListeningStatus();
         return;
       }
       if (!strongVoice) speakingSince = 0;
@@ -1120,6 +1141,7 @@ const startVoiceMode = async () => {
   isMicMuted = false;
   awaitingTurn = false;
   pendingTranscript = "";
+  lastTranscriptNorm = "";
   speakingSince = 0;
   lastSpeechAt = Date.now();
   lastActivityAt = Date.now();
@@ -1129,7 +1151,7 @@ const startVoiceMode = async () => {
   suppressBargeUntil = Date.now() + 1200;
   setMicUi(true);
   muteBtn.classList.remove("active");
-  setStatus("Listening...");
+  setListeningStatus();
 
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
   const source = audioContext.createMediaStreamSource(stream);
@@ -1148,6 +1170,7 @@ const stopVoiceMode = () => {
   isVoiceMode = false;
   awaitingTurn = false;
   pendingTranscript = "";
+  lastTranscriptNorm = "";
   speakingSince = 0;
   clearInterval(monitorTimer);
   monitorTimer = null;
@@ -1263,7 +1286,8 @@ muteBtn.addEventListener("click", () => {
     setStatus("Mic muted - tap red mute to continue");
   } else {
     startSpeechRecognition();
-    setStatus(isVoiceMode ? "Listening..." : "Idle");
+    if (isVoiceMode) setListeningStatus();
+    else setStatus("Idle");
     if (isVoiceMode && pendingTranscript.trim() && !awaitingTurn) {
       schedulePendingTranscriptSubmit(180);
     }
