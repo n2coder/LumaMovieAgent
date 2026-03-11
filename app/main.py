@@ -3,6 +3,7 @@ import base64
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 import json
+import math
 import re
 from threading import Lock
 import time
@@ -622,6 +623,31 @@ async def _process_voice_turn(
     return new_token
 
 
+def _audio_extension_from_mime(mime_type: str) -> str:
+    normalized = (mime_type or "").strip().lower()
+    if "webm" in normalized:
+        return ".webm"
+    if "ogg" in normalized:
+        return ".ogg"
+    if "mp4" in normalized or "m4a" in normalized:
+        return ".m4a"
+    if "wav" in normalized:
+        return ".wav"
+    if "mpeg" in normalized or "mp3" in normalized:
+        return ".mp3"
+    return ".webm"
+
+
+def _safe_decode_audio_b64(raw: str) -> bytes:
+    payload = (raw or "").strip()
+    if not payload:
+        return b""
+    try:
+        return base64.b64decode(payload, validate=True)
+    except Exception:
+        return b""
+
+
 app = FastAPI(
     title=settings.app_name,
     lifespan=lifespan,
@@ -741,6 +767,7 @@ async def ws_voice(websocket: WebSocket) -> None:
     current_peer_id = ""
     active_turn_task: asyncio.Task | None = None
     active_cancel_event = asyncio.Event()
+    ws_payload_limit_bytes = max(24_000, int(math.ceil(services.settings.max_audio_bytes * 1.6)))
 
     async def cancel_active_turn() -> None:
         nonlocal active_turn_task, active_cancel_event
@@ -757,7 +784,7 @@ async def ws_voice(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
-            if len(raw) > 24_000:
+            if len(raw) > ws_payload_limit_bytes:
                 await _send_json_locked(websocket, send_lock, {"type": "error", "detail": "payload too large"})
                 continue
             try:
@@ -888,6 +915,92 @@ async def ws_voice(websocket: WebSocket) -> None:
 
                 active_turn_task = asyncio.create_task(run_turn())
 
+            elif msg_type == "user_audio":
+                token_from_client = str(payload.get("session_token", "")).strip()
+                if token_from_client:
+                    current_session_token = token_from_client
+                if not current_session_token:
+                    await _send_json_locked(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "detail": "session is not initialized"},
+                    )
+                    continue
+                peer_from_client = str(payload.get("peer_id", "")).strip()
+                if peer_from_client:
+                    current_peer_id = peer_from_client
+
+                audio_b64 = str(payload.get("audio_b64", "")).strip()
+                mime_type = str(payload.get("mime_type", "")).strip()
+                lang_hint = str(payload.get("lang_hint", "")).strip().lower()
+                audio_bytes = _safe_decode_audio_b64(audio_b64)
+                if not audio_bytes:
+                    await _send_json_locked(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "detail": "invalid or empty audio payload"},
+                    )
+                    continue
+                if len(audio_bytes) > services.settings.max_audio_bytes:
+                    await _send_json_locked(
+                        websocket,
+                        send_lock,
+                        {"type": "error", "detail": f"audio too large (max {services.settings.max_audio_bytes} bytes)"},
+                    )
+                    continue
+
+                now = time.time()
+                with _rate_lock:
+                    bucket = _ws_rate_buckets[f"{client_ip}:ws:user_audio"]
+                    while bucket and now - bucket[0] > services.settings.rate_limit_window_sec:
+                        bucket.popleft()
+                    if len(bucket) >= services.settings.rate_limit_voice_per_window:
+                        await _send_json_locked(
+                            websocket,
+                            send_lock,
+                            {"type": "error", "detail": "Rate limit exceeded. Please retry shortly."},
+                        )
+                        continue
+                    bucket.append(now)
+
+                await cancel_active_turn()
+                active_cancel_event = asyncio.Event()
+                token_snapshot = current_session_token
+                ext = _audio_extension_from_mime(mime_type)
+
+                async def run_audio_turn() -> None:
+                    nonlocal current_session_token
+                    try:
+                        query = await services.stt.transcribe_bytes(audio_bytes, filename=f"ws_input{ext}")
+                    except HTTPException as exc:
+                        await _send_json_locked(
+                            websocket,
+                            send_lock,
+                            {"type": "error", "detail": exc.detail},
+                        )
+                        return
+                    query = (query or "").strip()
+                    if not query:
+                        await _send_json_locked(
+                            websocket,
+                            send_lock,
+                            {"type": "error", "detail": "could not transcribe audio"},
+                        )
+                        return
+                    new_token = await _process_voice_turn(
+                        websocket=websocket,
+                        send_lock=send_lock,
+                        services=services,
+                        session_token=token_snapshot,
+                        query=query,
+                        cancel_event=active_cancel_event,
+                        lang_hint=lang_hint,
+                        peer_id=current_peer_id,
+                    )
+                    current_session_token = new_token
+
+                active_turn_task = asyncio.create_task(run_audio_turn())
+
             elif msg_type == "barge_in":
                 await cancel_active_turn()
                 await _send_json_locked(websocket, send_lock, {"type": "barge_in_ack"})
@@ -896,7 +1009,11 @@ async def ws_voice(websocket: WebSocket) -> None:
                 await _send_json_locked(websocket, send_lock, {"type": "pong"})
 
             else:
-                await _send_json_locked(websocket, send_lock, {"type": "error", "detail": "unknown message type"})
+                await _send_json_locked(
+                    websocket,
+                    send_lock,
+                    {"type": "error", "detail": f"unknown message type: {msg_type or '<empty>'}"},
+                )
     except WebSocketDisconnect:
         pass
     finally:

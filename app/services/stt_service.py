@@ -11,11 +11,10 @@ class STTService:
         self.settings = settings
         self.client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 
-    async def transcribe(self, audio_file: UploadFile) -> str:
+    async def _transcribe_content(self, content: bytes, filename: str) -> str:
         if not self.client:
             raise HTTPException(status_code=500, detail="OpenAI API key is not configured for STT")
 
-        content = await audio_file.read()
         if len(content) > self.settings.max_audio_bytes:
             raise HTTPException(
                 status_code=413,
@@ -26,7 +25,7 @@ class STTService:
         try:
             response = await self.client.audio.transcriptions.create(
                 model=self.settings.openai_stt_model,
-                file=(audio_file.filename or "audio.webm", content),
+                file=(filename or "audio.webm", content),
             )
         except BadRequestError as exc:
             raise HTTPException(status_code=400, detail="Invalid audio input.") from exc
@@ -54,3 +53,10 @@ class STTService:
             except Exception:
                 pass
         return text
+
+    async def transcribe(self, audio_file: UploadFile) -> str:
+        content = await audio_file.read()
+        return await self._transcribe_content(content=content, filename=audio_file.filename or "audio.webm")
+
+    async def transcribe_bytes(self, content: bytes, filename: str = "audio.webm") -> str:
+        return await self._transcribe_content(content=content, filename=filename)

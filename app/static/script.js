@@ -25,9 +25,9 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 70,
     bargeStrongHoldMs: 120,
     bargeMinAudioMs: 120,
-    energyBase: 0.0018,
+    energyBase: 0.0015,
     calibrationMs: 700,
-    calibrationMultiplier: 1.12,
+    calibrationMultiplier: 1.08,
     echoSuppressMs: 260,
     bargeDynamicMultiplier: 1.04,
     bargeAssistantFloorMultiplier: 1.16,
@@ -39,9 +39,9 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 78,
     bargeStrongHoldMs: 130,
     bargeMinAudioMs: 140,
-    energyBase: 0.0016,
+    energyBase: 0.0012,
     calibrationMs: 900,
-    calibrationMultiplier: 1.15,
+    calibrationMultiplier: 1.06,
     echoSuppressMs: 300,
     bargeDynamicMultiplier: 1.05,
     bargeAssistantFloorMultiplier: 1.18,
@@ -53,9 +53,9 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 82,
     bargeStrongHoldMs: 140,
     bargeMinAudioMs: 150,
-    energyBase: 0.0015,
+    energyBase: 0.0011,
     calibrationMs: 1000,
-    calibrationMultiplier: 1.18,
+    calibrationMultiplier: 1.08,
     echoSuppressMs: 320,
     bargeDynamicMultiplier: 1.06,
     bargeAssistantFloorMultiplier: 1.2,
@@ -69,6 +69,12 @@ const TOP_ROTATE_MS = 18000;
 const RECOGNITION_LANGS = ["hi-IN", "en-IN"];
 const MIN_AUTO_QUERY_WORDS = 1;
 const MIN_AUTO_QUERY_CHARS = 3;
+const HAS_MEDIA_RECORDER = typeof window !== "undefined" && typeof window.MediaRecorder !== "undefined";
+const USE_BROWSER_SPEECH_RECOGNITION = !HAS_MEDIA_RECORDER;
+const RECORDER_MIN_SEGMENT_MS = 420;
+const RECORDER_MAX_SEGMENT_MS = 10000;
+const RECORDER_MIN_SEGMENT_BYTES = 1600;
+const RECORDER_MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
 
 const detectVadProfile = () => {
   const ua = navigator.userAgent || "";
@@ -115,6 +121,13 @@ let stream = null;
 let audioContext = null;
 let analyser = null;
 let monitorTimer = null;
+let micSourceNode = null;
+let vadWorkletNode = null;
+let vadSinkNode = null;
+let vadWorkletLoaded = false;
+let useWorkletVad = false;
+let latestMicRms = 0;
+let latestMicPeak = 0;
 let dynamicEnergyThreshold = VAD.energyBase;
 let speakingSince = 0;
 let lastSpeechAt = 0;
@@ -145,6 +158,17 @@ let audioPrimed = false;
 let topMoviePool = [];
 let topMovieRotateTimer = null;
 let pendingSubmitTimer = null;
+let recognizerPausedForPlayback = false;
+let mediaRecorder = null;
+let recorderMimeType = "";
+let recorderActiveChunks = [];
+let isRecordingSpeech = false;
+let speechCaptureStartedAt = 0;
+let speechCaptureLastVoiceAt = 0;
+let sendingAudioQuery = false;
+let recorderStopInFlight = false;
+let recorderDropOnStop = false;
+let captureSpeechSince = 0;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -772,6 +796,10 @@ const stopAssistantPlayback = (sendBargeIn = false) => {
     updateConversation(undefined, interruptionPrompt());
     setStatus("Listening...");
   }
+  if (USE_BROWSER_SPEECH_RECOGNITION && recognizerPausedForPlayback && isVoiceMode && !isMicMuted) {
+    startSpeechRecognition();
+    recognizerPausedForPlayback = false;
+  }
   playbackInterimText = "";
   playbackInterimAt = 0;
   audioStartedAt = 0;
@@ -794,6 +822,10 @@ const playNextAudioChunk = async () => {
   isAudioPlaying = true;
   audioStartedAt = Date.now();
   allowTranscriptDuringPlayback = false;
+  if (USE_BROWSER_SPEECH_RECOGNITION && speechRecognition) {
+    stopSpeechRecognition();
+    recognizerPausedForPlayback = true;
+  }
   try {
     await audioPlayer.play();
     setStatus("Luma speaking...");
@@ -813,6 +845,10 @@ audioPlayer.onended = () => {
   }
   if (!audioQueue.length) {
     transcriptBlockUntil = Date.now() + VAD.echoSuppressMs;
+    if (USE_BROWSER_SPEECH_RECOGNITION && recognizerPausedForPlayback && isVoiceMode && !isMicMuted) {
+      startSpeechRecognition();
+      recognizerPausedForPlayback = false;
+    }
   }
   markActivity();
   playNextAudioChunk();
@@ -827,6 +863,10 @@ audioPlayer.onerror = () => {
   }
   if (!audioQueue.length) {
     transcriptBlockUntil = Date.now() + VAD.echoSuppressMs;
+    if (USE_BROWSER_SPEECH_RECOGNITION && recognizerPausedForPlayback && isVoiceMode && !isMicMuted) {
+      startSpeechRecognition();
+      recognizerPausedForPlayback = false;
+    }
   }
   markActivity();
   playNextAudioChunk();
@@ -930,6 +970,7 @@ const handleWsMessage = (payload) => {
   if (type === "turn_cancelled") {
     markActivity();
     awaitingTurn = false;
+    sendingAudioQuery = false;
     bargeRequested = false;
     currentAssistantSource = "";
     if (isVoiceMode) setListeningStatus();
@@ -942,14 +983,16 @@ const handleWsMessage = (payload) => {
     bargeRequested = false;
     updateConversation(undefined, interruptionPrompt());
     setListeningStatus();
-    if (pendingTranscript.trim()) schedulePendingTranscriptSubmit(320);
+    if (USE_BROWSER_SPEECH_RECOGNITION && pendingTranscript.trim()) schedulePendingTranscriptSubmit(320);
     return;
   }
 
   if (type === "error") {
     awaitingTurn = false;
+    sendingAudioQuery = false;
     updateConversation(undefined, `Error: ${payload.detail || "Unknown voice error"}`);
-    setStatus("Error");
+    if (isVoiceMode) setListeningStatus();
+    else setStatus("Error");
     return;
   }
 
@@ -971,7 +1014,7 @@ const connectVoiceSocket = async () =>
       wsClosingIntentionally = false;
       wsReady = true;
       startWsHeartbeat();
-      if (pendingTranscript.trim() && !awaitingTurn && !isMicMuted) {
+      if (USE_BROWSER_SPEECH_RECOGNITION && pendingTranscript.trim() && !awaitingTurn && !isMicMuted) {
         schedulePendingTranscriptSubmit(280);
       }
       resolve();
@@ -1048,11 +1091,71 @@ const computeRmsEnergy = () => {
   return Math.sqrt(sum / data.length);
 };
 
+const getMicEnergy = () => {
+  if (useWorkletVad && latestMicRms > 0) return latestMicRms;
+  return computeRmsEnergy();
+};
+
+const detachVadWorklet = () => {
+  if (vadWorkletNode) {
+    try {
+      vadWorkletNode.port.onmessage = null;
+      vadWorkletNode.disconnect();
+    } catch (_) {
+      // ignore disconnect race
+    }
+  }
+  if (vadSinkNode) {
+    try {
+      vadSinkNode.disconnect();
+    } catch (_) {
+      // ignore disconnect race
+    }
+  }
+  vadWorkletNode = null;
+  vadSinkNode = null;
+  useWorkletVad = false;
+  latestMicRms = 0;
+  latestMicPeak = 0;
+};
+
+const attachVadWorklet = async () => {
+  if (!audioContext || !micSourceNode || !audioContext.audioWorklet) return;
+  detachVadWorklet();
+  try {
+    if (!vadWorkletLoaded) {
+      await audioContext.audioWorklet.addModule("/static/vad-worklet.js");
+      vadWorkletLoaded = true;
+    }
+    vadWorkletNode = new AudioWorkletNode(audioContext, "luma-vad-processor", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    vadWorkletNode.port.onmessage = (event) => {
+      const payload = event?.data;
+      if (!payload || payload.type !== "vad_frame") return;
+      const rms = Number(payload.rms || 0);
+      const peak = Number(payload.peak || 0);
+      if (Number.isFinite(rms) && rms >= 0) latestMicRms = rms;
+      if (Number.isFinite(peak) && peak >= 0) latestMicPeak = peak;
+    };
+    micSourceNode.connect(vadWorkletNode);
+    vadSinkNode = audioContext.createGain();
+    vadSinkNode.gain.value = 0;
+    vadWorkletNode.connect(vadSinkNode);
+    vadSinkNode.connect(audioContext.destination);
+    useWorkletVad = true;
+  } catch (_) {
+    detachVadWorklet();
+  }
+};
+
 const calibrateAmbientNoise = async (ms = VAD.calibrationMs) => {
   const started = Date.now();
   const samples = [];
   while (Date.now() - started < ms) {
-    samples.push(computeRmsEnergy());
+    samples.push(getMicEnergy());
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -1068,6 +1171,187 @@ const setMicCaptureEnabled = (enabled) => {
   });
 };
 
+const pickRecorderMimeType = () => {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  for (const mime of candidates) {
+    try {
+      if (MediaRecorder.isTypeSupported(mime)) return mime;
+    } catch (_) {
+      // keep probing candidates
+    }
+  }
+  return "";
+};
+
+const blobToBase64 = async (blob) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const raw = String(reader.result || "");
+      const idx = raw.indexOf(",");
+      resolve(idx >= 0 ? raw.slice(idx + 1) : raw);
+    };
+    reader.onerror = () => reject(new Error("Failed to read audio blob"));
+    reader.readAsDataURL(blob);
+  });
+
+const resetSpeechCaptureBuffers = () => {
+  recorderActiveChunks = [];
+  isRecordingSpeech = false;
+  speechCaptureStartedAt = 0;
+  speechCaptureLastVoiceAt = 0;
+  captureSpeechSince = 0;
+};
+
+const beginSpeechCapture = () => {
+  if (!HAS_MEDIA_RECORDER || !stream || sendingAudioQuery || awaitingTurn || isMicMuted) return;
+  if (isRecordingSpeech) return;
+
+  stopMediaRecorder(true);
+  recorderMimeType = pickRecorderMimeType();
+  recorderActiveChunks = [];
+  recorderStopInFlight = false;
+  recorderDropOnStop = false;
+
+  try {
+    const options = { audioBitsPerSecond: 24000 };
+    if (recorderMimeType) options.mimeType = recorderMimeType;
+    mediaRecorder = new MediaRecorder(stream, options);
+  } catch (_) {
+    mediaRecorder = null;
+    return;
+  }
+
+  mediaRecorder.ondataavailable = (event) => {
+    const chunk = event?.data;
+    if (chunk && chunk.size) recorderActiveChunks.push(chunk);
+  };
+
+  mediaRecorder.onerror = () => {
+    recorderStopInFlight = false;
+    recorderDropOnStop = false;
+    stopMediaRecorder(true);
+  };
+
+  mediaRecorder.onstop = async () => {
+    const chunks = recorderActiveChunks.slice();
+    const shouldDrop = recorderDropOnStop;
+    const mime = recorderMimeType || mediaRecorder?.mimeType || "audio/webm";
+
+    recorderStopInFlight = false;
+    recorderDropOnStop = false;
+    mediaRecorder = null;
+    resetSpeechCaptureBuffers();
+
+    if (shouldDrop || !chunks.length) return;
+
+    const blob = new Blob(chunks, { type: mime });
+    if (blob.size < RECORDER_MIN_SEGMENT_BYTES) return;
+    if (blob.size > RECORDER_MAX_SEGMENT_BYTES) {
+      updateConversation(undefined, "Voice clip too long. Please speak a shorter sentence.");
+      setListeningStatus();
+      return;
+    }
+    await submitVoiceAudioBlob(blob);
+  };
+
+  try {
+    mediaRecorder.start();
+    isRecordingSpeech = true;
+    speechCaptureStartedAt = Date.now();
+    speechCaptureLastVoiceAt = speechCaptureStartedAt;
+  } catch (_) {
+    stopMediaRecorder(true);
+  }
+};
+
+const submitVoiceAudioBlob = async (blob) => {
+  if (!blob || !blob.size || sendingAudioQuery || awaitingTurn || isMicMuted) return false;
+  if (!wsReady) {
+    setStatus("Reconnecting voice...");
+    scheduleWsReconnect();
+    return false;
+  }
+  sendingAudioQuery = true;
+  awaitingTurn = true;
+  allowTranscriptDuringPlayback = false;
+  setStatus("Transcribing...");
+  updateConversation(undefined, "Searching best movies...");
+  markActivity();
+  try {
+    const audioB64 = await blobToBase64(blob);
+    const sent = sendWs({
+      type: "user_audio",
+      audio_b64: audioB64,
+      mime_type: blob.type || recorderMimeType || "audio/webm",
+      lang_hint: lastDetectedLangHint || "en",
+      session_token: sessionToken || "",
+      peer_id: rtcPeerId || "",
+    });
+    if (!sent) {
+      awaitingTurn = false;
+      setStatus("Reconnecting voice...");
+      scheduleWsReconnect();
+      return false;
+    }
+    return true;
+  } catch (_) {
+    awaitingTurn = false;
+    setStatus("Listening...");
+    return false;
+  } finally {
+    sendingAudioQuery = false;
+  }
+};
+
+const flushSpeechCaptureIfReady = async (force = false) => {
+  if (!isRecordingSpeech) return false;
+  const now = Date.now();
+  const captureDuration = now - speechCaptureStartedAt;
+  const silenceDuration = now - speechCaptureLastVoiceAt;
+  if (!force && silenceDuration < VAD.silenceMs && captureDuration < RECORDER_MAX_SEGMENT_MS) {
+    return false;
+  }
+  if (!force && captureDuration < RECORDER_MIN_SEGMENT_MS) return false;
+  if (!mediaRecorder || recorderStopInFlight) return false;
+  recorderDropOnStop = false;
+  recorderStopInFlight = true;
+  try {
+    if (mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    return true;
+  } catch (_) {
+    recorderStopInFlight = false;
+    return false;
+  }
+};
+
+const stopMediaRecorder = (discard = true) => {
+  if (!mediaRecorder) return;
+  recorderDropOnStop = discard;
+  try {
+    if (mediaRecorder.state !== "inactive" && !recorderStopInFlight) {
+      recorderStopInFlight = true;
+      mediaRecorder.stop();
+      return;
+    }
+  } catch (_) {
+    // ignore stop race
+  }
+  recorderStopInFlight = false;
+  recorderDropOnStop = false;
+  mediaRecorder.ondataavailable = null;
+  mediaRecorder.onstop = null;
+  mediaRecorder.onerror = null;
+  mediaRecorder = null;
+  resetSpeechCaptureBuffers();
+};
+
 const stopSpeechRecognition = () => {
   if (!speechRecognition) return;
   try {
@@ -1080,6 +1364,7 @@ const stopSpeechRecognition = () => {
 };
 
 const startSpeechRecognition = () => {
+  if (!USE_BROWSER_SPEECH_RECOGNITION) return;
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR || speechRecognition) return;
 
@@ -1132,7 +1417,7 @@ const startSpeechRecognition = () => {
 
   recog.onerror = () => {};
   recog.onend = () => {
-    if (isVoiceMode && !isMicMuted) {
+    if (USE_BROWSER_SPEECH_RECOGNITION && isVoiceMode && !isMicMuted) {
       try {
         recog.lang = RECOGNITION_LANGS[recognitionLangIndex];
         recog.start();
@@ -1214,15 +1499,15 @@ const schedulePendingTranscriptSubmit = (delayMs = 950) => {
 const processVadTick = () => {
   if (!isVoiceMode || isMicMuted || !analyser) return;
 
-  const energy = computeRmsEnergy();
+  const now = Date.now();
+  const energy = getMicEnergy();
   lastEnergy = energy;
   const speaking = energy > dynamicEnergyThreshold;
 
   if (speaking) {
-    lastSpeechAt = Date.now();
+    lastSpeechAt = now;
     markActivity();
     if (assistantSpeaking()) {
-      const now = Date.now();
       const warmup = audioStartedAt && now - audioStartedAt < 350;
       const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= VAD.bargeMinAudioMs;
       assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
@@ -1230,20 +1515,23 @@ const processVadTick = () => {
         dynamicEnergyThreshold * VAD.bargeDynamicMultiplier,
         assistantEnergyFloor * VAD.bargeAssistantFloorMultiplier
       );
-      const strongVoice = energy > bargeLevel;
+      const strongVoice = energy > bargeLevel * 1.12;
       if (!speakingSince) speakingSince = now;
-      const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs;
+      const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs + 80;
       const strongVoiceOnly =
-        now - speakingSince >= VAD.bargeStrongHoldMs && energy > bargeLevel * VAD.bargeStrongMultiplier;
+        now - speakingSince >= VAD.bargeStrongHoldMs + 120 &&
+        energy > bargeLevel * (VAD.bargeStrongMultiplier + 0.12);
       if (
         !warmup &&
         minPlaybackElapsed &&
-        Date.now() >= suppressBargeUntil &&
+        now >= suppressBargeUntil &&
         strongVoice &&
         (sustainedVoice || strongVoiceOnly)
       ) {
         stopAssistantPlayback(true);
-        lastSpeechAt = Date.now();
+        beginSpeechCapture();
+        speechCaptureLastVoiceAt = now;
+        lastSpeechAt = now;
         speakingSince = 0;
         playbackInterimText = "";
         playbackInterimAt = 0;
@@ -1253,32 +1541,55 @@ const processVadTick = () => {
       if (!strongVoice) speakingSince = 0;
     } else {
       speakingSince = 0;
+      if (!captureSpeechSince) captureSpeechSince = now;
+    }
+    if (!awaitingTurn && !sendingAudioQuery && !isRecordingSpeech && now - captureSpeechSince >= 120) {
+      beginSpeechCapture();
+    }
+    if (isRecordingSpeech) {
+      speechCaptureLastVoiceAt = now;
+      if (isRecordingSpeech && now - speechCaptureStartedAt >= RECORDER_MAX_SEGMENT_MS) {
+        void flushSpeechCaptureIfReady(true);
+      }
     }
     return;
   }
 
   speakingSince = 0;
-  if (
-    pendingTranscript.trim() &&
-    !assistantSpeaking() &&
-    !awaitingTurn &&
-    Date.now() >= transcriptBlockUntil &&
-    Date.now() - lastSpeechAt >= VAD.silenceMs
-  ) {
-    trySubmitPendingTranscript();
-  } else if (
-    pendingTranscript.trim() &&
-    !assistantSpeaking() &&
-    !awaitingTurn &&
-    Date.now() >= transcriptBlockUntil &&
-    Date.now() - lastRecognitionResultAt >= 1200
-  ) {
-    // Safety net for cases where VAD silence transition is missed.
-    trySubmitPendingTranscript();
+  captureSpeechSince = 0;
+  if (!assistantSpeaking() && isRecordingSpeech && !awaitingTurn && !sendingAudioQuery) {
+    void flushSpeechCaptureIfReady(false);
+  }
+
+  if (USE_BROWSER_SPEECH_RECOGNITION) {
+    if (
+      pendingTranscript.trim() &&
+      !assistantSpeaking() &&
+      !awaitingTurn &&
+      Date.now() >= transcriptBlockUntil &&
+      Date.now() - lastSpeechAt >= VAD.silenceMs
+    ) {
+      trySubmitPendingTranscript();
+    } else if (
+      pendingTranscript.trim() &&
+      !assistantSpeaking() &&
+      !awaitingTurn &&
+      Date.now() >= transcriptBlockUntil &&
+      Date.now() - lastRecognitionResultAt >= 1200
+    ) {
+      // Safety net for cases where VAD silence transition is missed.
+      trySubmitPendingTranscript();
+    }
   }
 
   const idleFor = Date.now() - Math.max(lastSpeechAt || 0, lastActivityAt || 0);
-  if (!awaitingTurn && !assistantSpeaking() && !pendingTranscript.trim() && idleFor >= MIC_IDLE_TIMEOUT_MS) {
+  if (
+    !awaitingTurn &&
+    !assistantSpeaking() &&
+    !isRecordingSpeech &&
+    !pendingTranscript.trim() &&
+    idleFor >= MIC_IDLE_TIMEOUT_MS
+  ) {
     updateConversation(undefined, "Mic paused after 30 seconds of silence.");
     stopVoiceMode();
   }
@@ -1293,6 +1604,7 @@ const startVoiceMode = async () => {
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
+        sampleRate: 16000,
         channelCount: 1,
       },
     });
@@ -1333,12 +1645,19 @@ const startVoiceMode = async () => {
   setListeningStatus();
 
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  const source = audioContext.createMediaStreamSource(stream);
+  try {
+    if (audioContext.state === "suspended") await audioContext.resume();
+  } catch (_) {
+    // ignore resume timing races
+  }
+  micSourceNode = audioContext.createMediaStreamSource(stream);
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 1024;
-  source.connect(analyser);
+  micSourceNode.connect(analyser);
+  await attachVadWorklet();
 
-  startSpeechRecognition();
+  recorderMimeType = pickRecorderMimeType();
+  if (USE_BROWSER_SPEECH_RECOGNITION) startSpeechRecognition();
   await calibrateAmbientNoise();
   monitorTimer = setInterval(processVadTick, VAD.vadIntervalMs);
 
@@ -1357,9 +1676,21 @@ const stopVoiceMode = () => {
 
   stopAssistantPlayback(false);
   stopSpeechRecognition();
+  recognizerPausedForPlayback = false;
+  stopMediaRecorder();
+  sendingAudioQuery = false;
 
   if (stream) stream.getTracks().forEach((track) => track.stop());
   stream = null;
+  detachVadWorklet();
+  if (micSourceNode) {
+    try {
+      micSourceNode.disconnect();
+    } catch (_) {
+      // ignore disconnect race
+    }
+  }
+  micSourceNode = null;
   if (audioContext) {
     audioContext.close();
   }
@@ -1387,7 +1718,7 @@ const postRecommend = async () => {
       isMicMuted = false;
       muteBtn.classList.remove("active");
       setMicCaptureEnabled(true);
-      startSpeechRecognition();
+      if (USE_BROWSER_SPEECH_RECOGNITION) startSpeechRecognition();
       setStatus("Listening...");
     }
     submitVoiceQuery(query);
@@ -1446,8 +1777,18 @@ queryInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") postRecommend();
 });
 
+const resumeAudioIfNeeded = async () => {
+  if (!audioContext) return;
+  try {
+    if (audioContext.state === "suspended") await audioContext.resume();
+  } catch (_) {
+    // ignore resume errors from browser policy races
+  }
+};
+
 voiceBtn.addEventListener("click", async () => {
   try {
+    await resumeAudioIfNeeded();
     if (isVoiceMode) stopVoiceMode();
     else await startVoiceMode();
   } catch (err) {
@@ -1457,15 +1798,24 @@ voiceBtn.addEventListener("click", async () => {
   }
 });
 
+window.addEventListener(
+  "pointerdown",
+  () => {
+    resumeAudioIfNeeded();
+  },
+  { passive: true }
+);
+
 muteBtn.addEventListener("click", () => {
   isMicMuted = !isMicMuted;
   muteBtn.classList.toggle("active", isMicMuted);
   setMicCaptureEnabled(!isMicMuted);
   if (isMicMuted) {
     stopSpeechRecognition();
+    stopMediaRecorder(true);
     setStatus("Mic muted - tap red mute to continue");
   } else {
-    startSpeechRecognition();
+    if (USE_BROWSER_SPEECH_RECOGNITION) startSpeechRecognition();
     if (isVoiceMode) setListeningStatus();
     else setStatus("Idle");
     if (isVoiceMode && pendingTranscript.trim() && !awaitingTurn) {
