@@ -34,10 +34,6 @@ const PLATFORM_VAD_CONFIG = {
     bargeStrongMultiplier: 1.03,
     bargeMinMicToPlaybackRatio: 1.25,
     bargeRequireTranscript: false,
-    serverBargeHoldMs: 220,
-    serverBargeMinAudioMs: 260,
-    serverBargeMinScore: 0.006,
-    serverBargeFreshMs: 1500,
   },
   android: {
     silenceMs: 1050,
@@ -53,11 +49,7 @@ const PLATFORM_VAD_CONFIG = {
     bargeAssistantFloorMultiplier: 1.18,
     bargeStrongMultiplier: 1.04,
     bargeMinMicToPlaybackRatio: 1.95,
-    bargeRequireTranscript: false,
-    serverBargeHoldMs: 520,
-    serverBargeMinAudioMs: 700,
-    serverBargeMinScore: 0.010,
-    serverBargeFreshMs: 1900,
+    bargeRequireTranscript: true,
   },
   ios: {
     silenceMs: 1100,
@@ -73,11 +65,7 @@ const PLATFORM_VAD_CONFIG = {
     bargeAssistantFloorMultiplier: 1.2,
     bargeStrongMultiplier: 1.05,
     bargeMinMicToPlaybackRatio: 2.2,
-    bargeRequireTranscript: false,
-    serverBargeHoldMs: 620,
-    serverBargeMinAudioMs: 820,
-    serverBargeMinScore: 0.011,
-    serverBargeFreshMs: 2100,
+    bargeRequireTranscript: true,
   },
 };
 const MIC_IDLE_TIMEOUT_MS = 30000;
@@ -124,7 +112,6 @@ let serverVadAvailable = false;
 let serverVadSpeech = false;
 let serverVadAt = 0;
 let serverVadScore = 0;
-let serverSpeechSince = 0;
 let sessionId = null;
 let sessionToken = null;
 let awaitingTurn = false;
@@ -414,11 +401,6 @@ const handleVadStatePayload = (payload) => {
   serverVadScore = Number(payload?.score || 0);
   serverVadAt = Date.now();
   if (serverVadSpeech) {
-    if (!serverSpeechSince) serverSpeechSince = serverVadAt;
-  } else {
-    serverSpeechSince = 0;
-  }
-  if (serverVadSpeech) {
     lastSpeechAt = Date.now();
     markActivity();
   }
@@ -446,7 +428,6 @@ const closeWebRtcPeer = async () => {
   serverVadSpeech = false;
   serverVadAt = 0;
   serverVadScore = 0;
-  serverSpeechSince = 0;
   const oldPeerId = rtcPeerId;
   rtcPeerId = "";
   if (oldPeerId) {
@@ -478,7 +459,6 @@ const connectWebRtcPeer = async () => {
   serverVadSpeech = false;
   serverVadAt = 0;
   serverVadScore = 0;
-  serverSpeechSince = 0;
 
   rtcDataChannel = pc.createDataChannel("audio_downlink");
   rtcDataChannel.onopen = () => {
@@ -927,7 +907,6 @@ const handleWsMessage = (payload) => {
     serverVadSpeech = false;
     serverVadAt = 0;
     serverVadScore = 0;
-    serverSpeechSince = 0;
     if (payload.source === "query" && payload.query) {
       updateConversation(payload.query, "Searching best movies...");
       setStatus("Searching best movies...");
@@ -991,7 +970,6 @@ const handleWsMessage = (payload) => {
     serverVadSpeech = false;
     serverVadAt = 0;
     serverVadScore = 0;
-    serverSpeechSince = 0;
     if (payload.end_session) {
       stopVoiceMode();
       return;
@@ -1010,7 +988,6 @@ const handleWsMessage = (payload) => {
     serverVadSpeech = false;
     serverVadAt = 0;
     serverVadScore = 0;
-    serverSpeechSince = 0;
     if (isVoiceMode) setListeningStatus();
     return;
   }
@@ -1308,120 +1285,82 @@ const schedulePendingTranscriptSubmit = (delayMs = 950) => {
 const processVadTick = () => {
   if (!isVoiceMode || isMicMuted || !analyser) return;
 
-  const now = Date.now();
   const energy = computeRmsEnergy();
   lastEnergy = energy;
   const speaking = energy > dynamicEnergyThreshold;
-  const assistantActive = assistantSpeaking();
 
-  if (assistantActive) {
-    const warmup = audioStartedAt && now - audioStartedAt < 350;
-    const candidateFresh =
-      bargeTranscriptCandidate.trim().length >= 2 &&
-      now - bargeTranscriptAt <= 2300 &&
-      !isLikelyAssistantEcho(bargeTranscriptCandidate);
-    const requireServerVadGate = serverVadAvailable && !!rtcPeerId;
-
-    if (requireServerVadGate) {
-      if (!serverVadSpeech || now - serverVadAt > (VAD.serverBargeFreshMs || 1500)) {
-        serverSpeechSince = 0;
-        speakingSince = 0;
-        return;
-      }
-      if (!serverSpeechSince) serverSpeechSince = now;
-      const stableServerSpeech = now - serverSpeechSince >= (VAD.serverBargeHoldMs || 250);
-      const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= (VAD.serverBargeMinAudioMs || 280);
-      const strongServerScore = serverVadScore >= (VAD.serverBargeMinScore || 0.006);
-      const transcriptGate = VAD.bargeRequireTranscript ? candidateFresh : true;
-
+  if (speaking) {
+    lastSpeechAt = Date.now();
+    markActivity();
+    if (assistantSpeaking()) {
+      const now = Date.now();
+      const warmup = audioStartedAt && now - audioStartedAt < 350;
+      const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= VAD.bargeMinAudioMs;
+      assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
+      const playbackEnergy = computePlaybackEnergy();
+      const playbackRef = Math.max(playbackEnergy, assistantEnergyFloor * 0.9, 0.00008);
+      const micToPlaybackRatio = energy / playbackRef;
+      const bargeLevel = Math.max(
+        dynamicEnergyThreshold * VAD.bargeDynamicMultiplier,
+        assistantEnergyFloor * VAD.bargeAssistantFloorMultiplier
+      );
+      const strongVoice = energy > bargeLevel;
+      const clearMicLead = micToPlaybackRatio >= (VAD.bargeMinMicToPlaybackRatio || 1.35);
+      if (!speakingSince) speakingSince = now;
+      const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs;
+      const strongVoiceOnly =
+        now - speakingSince >= VAD.bargeStrongHoldMs && energy > bargeLevel * VAD.bargeStrongMultiplier;
+      const candidateFresh =
+        bargeTranscriptCandidate.trim().length >= 2 &&
+        now - bargeTranscriptAt <= 2300 &&
+        !isLikelyAssistantEcho(bargeTranscriptCandidate);
+      const transcriptGate = VAD.bargeRequireTranscript ? candidateFresh : candidateFresh || strongVoiceOnly;
+      const serverSpeechFresh = serverVadSpeech && now - serverVadAt <= 1300;
+      const requireServerVadGate = serverVadAvailable && !!rtcPeerId;
+      const serverVadGate = !requireServerVadGate || serverSpeechFresh;
       if (
         !warmup &&
         minPlaybackElapsed &&
-        now >= suppressBargeUntil &&
+        Date.now() >= suppressBargeUntil &&
+        strongVoice &&
+        clearMicLead &&
         transcriptGate &&
-        (stableServerSpeech || strongServerScore)
+        serverVadGate &&
+        (sustainedVoice || strongVoiceOnly)
       ) {
         if (candidateFresh) {
           pendingTranscript = bargeTranscriptCandidate.trim();
           lastTranscriptNorm = normalizeText(pendingTranscript);
           updateConversation(pendingTranscript, convAgentText.textContent);
+        } else {
+          pendingTranscript = "";
+          lastTranscriptNorm = "";
         }
         bargeTranscriptCandidate = "";
         bargeTranscriptAt = 0;
         stopAssistantPlayback(true);
-        lastSpeechAt = now;
+        lastSpeechAt = Date.now();
         speakingSince = 0;
         playbackInterimText = "";
         playbackInterimAt = 0;
         setListeningStatus();
+        return;
       }
-      return;
-    }
-
-    // Fallback path if server VAD channel is unavailable.
-    if (!speaking) {
-      speakingSince = 0;
-      return;
-    }
-    assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
-    const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= VAD.bargeMinAudioMs;
-    const playbackEnergy = computePlaybackEnergy();
-    const playbackRef = Math.max(playbackEnergy, assistantEnergyFloor * 0.9, 0.00008);
-    const micToPlaybackRatio = energy / playbackRef;
-    const bargeLevel = Math.max(
-      dynamicEnergyThreshold * VAD.bargeDynamicMultiplier,
-      assistantEnergyFloor * VAD.bargeAssistantFloorMultiplier
-    );
-    const strongVoice = energy > bargeLevel;
-    const clearMicLead = micToPlaybackRatio >= (VAD.bargeMinMicToPlaybackRatio || 1.35);
-    if (!speakingSince) speakingSince = now;
-    const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs;
-    const strongVoiceOnly =
-      now - speakingSince >= VAD.bargeStrongHoldMs && energy > bargeLevel * VAD.bargeStrongMultiplier;
-    const transcriptGate = VAD.bargeRequireTranscript ? candidateFresh : candidateFresh || strongVoiceOnly;
-    if (
-      !warmup &&
-      minPlaybackElapsed &&
-      now >= suppressBargeUntil &&
-      strongVoice &&
-      clearMicLead &&
-      transcriptGate &&
-      (sustainedVoice || strongVoiceOnly)
-    ) {
-      if (candidateFresh) {
-        pendingTranscript = bargeTranscriptCandidate.trim();
-        lastTranscriptNorm = normalizeText(pendingTranscript);
-        updateConversation(pendingTranscript, convAgentText.textContent);
-      }
-      bargeTranscriptCandidate = "";
-      bargeTranscriptAt = 0;
-      stopAssistantPlayback(true);
-      lastSpeechAt = now;
-      speakingSince = 0;
-      playbackInterimText = "";
-      playbackInterimAt = 0;
-      setListeningStatus();
-    } else if (!strongVoice) {
+      if (!strongVoice) speakingSince = 0;
+    } else {
       speakingSince = 0;
     }
-    return;
-  }
-
-  if (speaking) {
-    lastSpeechAt = now;
-    markActivity();
-    speakingSince = 0;
     return;
   }
 
   speakingSince = 0;
-  if (bargeTranscriptCandidate && now - bargeTranscriptAt > 2600) {
+  if (bargeTranscriptCandidate && Date.now() - bargeTranscriptAt > 2600) {
     bargeTranscriptCandidate = "";
     bargeTranscriptAt = 0;
   }
   if (
     pendingTranscript.trim() &&
-    !assistantActive &&
+    !assistantSpeaking() &&
     !awaitingTurn &&
     Date.now() >= transcriptBlockUntil &&
     Date.now() - lastSpeechAt >= VAD.silenceMs
@@ -1429,7 +1368,7 @@ const processVadTick = () => {
     trySubmitPendingTranscript();
   } else if (
     pendingTranscript.trim() &&
-    !assistantActive &&
+    !assistantSpeaking() &&
     !awaitingTurn &&
     Date.now() >= transcriptBlockUntil &&
     Date.now() - lastRecognitionResultAt >= 1200
@@ -1438,8 +1377,8 @@ const processVadTick = () => {
     trySubmitPendingTranscript();
   }
 
-  const idleFor = now - Math.max(lastSpeechAt || 0, lastActivityAt || 0);
-  if (!awaitingTurn && !assistantActive && !pendingTranscript.trim() && idleFor >= MIC_IDLE_TIMEOUT_MS) {
+  const idleFor = Date.now() - Math.max(lastSpeechAt || 0, lastActivityAt || 0);
+  if (!awaitingTurn && !assistantSpeaking() && !pendingTranscript.trim() && idleFor >= MIC_IDLE_TIMEOUT_MS) {
     updateConversation(undefined, "Mic paused after 30 seconds of silence.");
     stopVoiceMode();
   }
@@ -1487,7 +1426,6 @@ const startVoiceMode = async () => {
   serverVadSpeech = false;
   serverVadAt = 0;
   serverVadScore = 0;
-  serverSpeechSince = 0;
   speakingSince = 0;
   lastSpeechAt = Date.now();
   lastActivityAt = Date.now();

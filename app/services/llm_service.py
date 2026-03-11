@@ -214,33 +214,6 @@ RECOMMEND_INTENT_KEYWORDS = [
     "एनिथिंग एल्स",
 ]
 
-FOLLOWUP_MORE_TERMS = [
-    "few more",
-    "some more",
-    "more please",
-    "something else",
-    "anything else",
-    "another one",
-    "one more",
-    "more like this",
-    "show something else",
-    "tell me something else",
-    "aur kuch",
-    "aur koi",
-    "kuch aur",
-    "koi aur",
-    "और कुछ",
-    "कुछ और",
-    "कोई और",
-    "एक और",
-    "और दिखाओ",
-    "कुछ और दिखाओ",
-    "और",
-    "aur",
-    "समथिंग एल्स",
-    "एनिथिंग एल्स",
-]
-
 GENRE_HINTS = [
     "action",
     "thriller",
@@ -467,7 +440,23 @@ def is_recommendation_intent(query: str) -> bool:
         if _normalize_query(key) in q:
             return True
 
-    if any(_normalize_query(term) in q for term in FOLLOWUP_MORE_TERMS):
+    followup_more_terms = [
+        "something else",
+        "anything else",
+        "another one",
+        "one more",
+        "more like this",
+        "aur kuch",
+        "kuch aur",
+        "aur koi",
+        "और कुछ",
+        "कुछ और",
+        "कोई और",
+        "एक और",
+        "समथिंग एल्स",
+        "एनिथिंग एल्स",
+    ]
+    if any(_normalize_query(term) in q for term in followup_more_terms):
         return True
 
     has_movie_term = any(
@@ -490,52 +479,6 @@ def is_recommendation_intent(query: str) -> bool:
         return True
 
     return False
-
-
-def is_followup_more_query(query: str) -> bool:
-    q = _normalize_query(query)
-    if not q:
-        return False
-    has_more_term = any(_normalize_query(term) in q for term in FOLLOWUP_MORE_TERMS)
-    if not has_more_term and re.search(
-        r"\b(few more|some more|more please|one more|another one|anything else|something else)\b", q
-    ):
-        has_more_term = True
-    if not has_more_term and q in {"aur", "और"}:
-        has_more_term = True
-    if not has_more_term:
-        return False
-    # If user already provided fresh genre/category details, treat it as a new explicit query.
-    has_genre_hint = any(_normalize_query(g) in q for g in GENRE_HINTS)
-    if has_genre_hint:
-        return False
-    token_count = len(q.split())
-    return token_count <= 10
-
-
-def resolve_recommendation_query(query: str, history: List[dict] | None = None) -> str:
-    raw = (query or "").strip()
-    if not raw:
-        return raw
-    if not is_followup_more_query(raw):
-        return raw
-
-    history = history or []
-    raw_norm = _normalize_query(raw)
-    for item in reversed(history):
-        if str(item.get("role", "")).strip() != "user":
-            continue
-        prev = str(item.get("content", "")).strip()
-        if not prev:
-            continue
-        prev_norm = _normalize_query(prev)
-        if not prev_norm or prev_norm == raw_norm:
-            continue
-        if check_identity(prev) or is_small_talk_query(prev):
-            continue
-        if is_recommendation_intent(prev) or any(_normalize_query(g) in prev_norm for g in GENRE_HINTS):
-            return f"{prev}. User asked for more recommendations in the same genre/category."
-    return raw
 
 
 def policy_response_for_query(user_text: str) -> str | None:
@@ -653,7 +596,7 @@ def build_grounded_recommendation_text(query: str, movies: List[dict], output_la
             return "मुझे अभी सही मैच नहीं मिला। क्या आप अपनी पसंद थोड़ा और स्पष्ट कर सकते हैं, जैसे जॉनर या मूड?"
         return "I could not find a strong match yet. Please share a bit more detail like genre or mood."
 
-    top = movies[: min(3, len(movies))]
+    top = movies[: min(2, len(movies))]
     titles = [str(m.get("title", "")).strip() for m in top if str(m.get("title", "")).strip()]
     if not titles:
         return "I found options, but titles are missing. Please try again."
@@ -850,12 +793,12 @@ def build_recommendation_messages(
         f"{language_rule}\n"
         "Use only movies from <available_recommendations>.\n"
         "Start with one short opening line.\n"
-        "Recommend exactly 3 best movies.\n"
+        "Recommend exactly 2 best movies.\n"
         "For each movie, give only one short description sentence (max 16 words).\n"
         "Speak in a fluid voice-first style. No markdown and no bullets.\n"
         "Use short spoken sentences and natural transitions.\n"
         "End with one short follow-up question.\n"
-        "Keep the full reply concise: around 5 spoken sentences total.\n"
+        "Keep the full reply concise: around 4 spoken sentences total.\n"
     )
 
     return [
@@ -882,12 +825,12 @@ async def generate_grounded_recommendation_text(
             history=history or [],
             output_language=lang,
         )
-        text = _trim_spoken_response(await llm.generate_messages(messages), max_sentences=6, max_chars=430)
+        text = _trim_spoken_response(await llm.generate_messages(messages), max_sentences=5, max_chars=340)
         if not text:
             return build_grounded_recommendation_text(query=query, movies=movies, output_language=lang)
         if lang == "hi":
             text = await _force_hindi_devanagari(llm, text)
-            text = _trim_spoken_response(text, max_sentences=6, max_chars=430)
+            text = _trim_spoken_response(text, max_sentences=5, max_chars=340)
 
         movie_titles = [str(m.get("title", "")).strip() for m in movies if str(m.get("title", "")).strip()]
         normalized_answer = _normalize_for_match(text)
