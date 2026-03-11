@@ -5,11 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-import numpy as np
 from fastapi import HTTPException
-
-from app.config import get_settings
-from app.services.silero_vad_service import SileroStreamState, get_silero_vad_service
 
 try:
     from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -24,17 +20,12 @@ class WebRtcPeer:
     pc: Any
     audio_channel: Any | None = None
     last_seen: float = field(default_factory=lambda: time.time())
-    vad_stream: SileroStreamState | None = None
-    vad_state: bool = False
-    last_vad_emit: float = 0.0
 
 
 class WebRtcBridge:
     def __init__(self) -> None:
         self._peers: dict[str, WebRtcPeer] = {}
         self._lock = asyncio.Lock()
-        self._settings = get_settings()
-        self._vad = get_silero_vad_service(self._settings)
 
     @property
     def is_available(self) -> bool:
@@ -49,7 +40,7 @@ class WebRtcBridge:
 
         pc = RTCPeerConnection()
         peer_id = uuid4().hex
-        peer = WebRtcPeer(peer_id=peer_id, pc=pc, vad_stream=self._vad.new_stream())
+        peer = WebRtcPeer(peer_id=peer_id, pc=pc)
 
         @pc.on("datachannel")
         def on_datachannel(channel):
@@ -66,22 +57,6 @@ class WebRtcBridge:
             def _on_message(_msg):
                 peer.last_seen = time.time()
 
-            # Frontend can immediately know server-side VAD is wired.
-            try:
-                channel.send(
-                    json.dumps(
-                        {
-                            "type": "vad_state",
-                            "speech": False,
-                            "score": 0.0,
-                            "source": "silero",
-                            "enabled": self._vad.is_ready(),
-                        }
-                    )
-                )
-            except Exception:
-                pass
-
         @pc.on("track")
         def on_track(track):
             if track.kind != "audio":
@@ -90,9 +65,8 @@ class WebRtcBridge:
             async def _drain_audio():
                 try:
                     while True:
-                        frame = await track.recv()
+                        await track.recv()
                         peer.last_seen = time.time()
-                        await self._process_vad_frame(peer, frame)
                 except Exception:
                     return
 
@@ -144,71 +118,6 @@ class WebRtcBridge:
         except Exception:
             return False
 
-    async def _process_vad_frame(self, peer: WebRtcPeer, frame: Any) -> None:
-        if not self._vad.is_ready():
-            return
-        if peer.vad_stream is None:
-            peer.vad_stream = self._vad.new_stream()
-        samples, sample_rate = self._frame_to_mono_float32(frame)
-        if samples.size == 0:
-            return
-
-        speaking, score, changed = self._vad.process_chunk(peer.vad_stream, samples, sample_rate)
-        now = time.time()
-        emit_interval = 0.22
-        should_emit = changed or (speaking and now - peer.last_vad_emit >= emit_interval)
-        if should_emit:
-            await self._send_vad_state(peer, speaking=speaking, score=score)
-
-    async def _send_vad_state(self, peer: WebRtcPeer, speaking: bool, score: float) -> None:
-        channel = peer.audio_channel
-        if not channel or getattr(channel, "readyState", "") != "open":
-            peer.vad_state = speaking
-            peer.last_vad_emit = time.time()
-            return
-        payload = {
-            "type": "vad_state",
-            "speech": bool(speaking),
-            "score": round(float(score), 4),
-            "source": "silero",
-            "enabled": True,
-        }
-        try:
-            channel.send(json.dumps(payload))
-            peer.vad_state = bool(speaking)
-            peer.last_vad_emit = time.time()
-        except Exception:
-            return
-
-    @staticmethod
-    def _frame_to_mono_float32(frame: Any) -> tuple[np.ndarray, int]:
-        try:
-            raw = frame.to_ndarray()
-        except Exception:
-            return np.asarray([], dtype=np.float32), 0
-
-        arr = np.asarray(raw)
-        if arr.size == 0:
-            return np.asarray([], dtype=np.float32), 0
-
-        if arr.ndim == 1:
-            mono = arr
-        elif arr.ndim == 2:
-            # aiortc audio frame is typically [channels, samples].
-            mono = arr.mean(axis=0) if arr.shape[0] <= arr.shape[1] else arr.mean(axis=1)
-        else:
-            mono = arr.reshape(-1)
-
-        if np.issubdtype(mono.dtype, np.integer):
-            scale = float(np.iinfo(mono.dtype).max or 1)
-            mono = mono.astype(np.float32) / scale
-        else:
-            mono = mono.astype(np.float32, copy=False)
-
-        mono = np.clip(mono, -1.0, 1.0)
-        sample_rate = int(getattr(frame, "sample_rate", 0) or 0)
-        return mono, sample_rate
-
 
 _webrtc_bridge: WebRtcBridge | None = None
 
@@ -218,3 +127,4 @@ def get_webrtc_bridge() -> WebRtcBridge:
     if _webrtc_bridge is None:
         _webrtc_bridge = WebRtcBridge()
     return _webrtc_bridge
+

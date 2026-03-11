@@ -25,15 +25,13 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 70,
     bargeStrongHoldMs: 120,
     bargeMinAudioMs: 120,
-    energyBase: 0.0014,
+    energyBase: 0.0018,
     calibrationMs: 700,
     calibrationMultiplier: 1.12,
     echoSuppressMs: 260,
     bargeDynamicMultiplier: 1.04,
     bargeAssistantFloorMultiplier: 1.16,
     bargeStrongMultiplier: 1.03,
-    bargeMinMicToPlaybackRatio: 1.25,
-    bargeRequireTranscript: false,
   },
   android: {
     silenceMs: 1050,
@@ -41,15 +39,13 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 78,
     bargeStrongHoldMs: 130,
     bargeMinAudioMs: 140,
-    energyBase: 0.00115,
+    energyBase: 0.0016,
     calibrationMs: 900,
     calibrationMultiplier: 1.15,
     echoSuppressMs: 300,
     bargeDynamicMultiplier: 1.05,
     bargeAssistantFloorMultiplier: 1.18,
     bargeStrongMultiplier: 1.04,
-    bargeMinMicToPlaybackRatio: 1.95,
-    bargeRequireTranscript: true,
   },
   ios: {
     silenceMs: 1100,
@@ -57,15 +53,13 @@ const PLATFORM_VAD_CONFIG = {
     bargeHoldMs: 82,
     bargeStrongHoldMs: 140,
     bargeMinAudioMs: 150,
-    energyBase: 0.00105,
+    energyBase: 0.0015,
     calibrationMs: 1000,
     calibrationMultiplier: 1.18,
     echoSuppressMs: 320,
     bargeDynamicMultiplier: 1.06,
     bargeAssistantFloorMultiplier: 1.2,
     bargeStrongMultiplier: 1.05,
-    bargeMinMicToPlaybackRatio: 2.2,
-    bargeRequireTranscript: true,
   },
 };
 const MIC_IDLE_TIMEOUT_MS = 30000;
@@ -108,10 +102,6 @@ let rtcPeer = null;
 let rtcPeerId = "";
 let rtcDataChannel = null;
 let rtcReady = false;
-let serverVadAvailable = false;
-let serverVadSpeech = false;
-let serverVadAt = 0;
-let serverVadScore = 0;
 let sessionId = null;
 let sessionToken = null;
 let awaitingTurn = false;
@@ -124,9 +114,6 @@ let isMicMuted = false;
 let stream = null;
 let audioContext = null;
 let analyser = null;
-let playbackAnalyser = null;
-let micSourceNode = null;
-let playbackSourceNode = null;
 let monitorTimer = null;
 let dynamicEnergyThreshold = VAD.energyBase;
 let speakingSince = 0;
@@ -150,8 +137,6 @@ let lastAssistantUtterance = "";
 let currentAssistantSource = "";
 let lastDetectedLangHint = "en";
 let lastTranscriptNorm = "";
-let bargeTranscriptCandidate = "";
-let bargeTranscriptAt = 0;
 
 let isAudioPlaying = false;
 let activeAudioUrl = null;
@@ -395,17 +380,6 @@ const handleAudioChunkPayload = (payload) => {
   enqueueAudioChunk(payload?.audio_b64 || "");
 };
 
-const handleVadStatePayload = (payload) => {
-  serverVadAvailable = payload?.enabled !== false;
-  serverVadSpeech = payload?.speech === true;
-  serverVadScore = Number(payload?.score || 0);
-  serverVadAt = Date.now();
-  if (serverVadSpeech) {
-    lastSpeechAt = Date.now();
-    markActivity();
-  }
-};
-
 const closeWebRtcPeer = async () => {
   if (rtcDataChannel) {
     try {
@@ -424,10 +398,6 @@ const closeWebRtcPeer = async () => {
   }
   rtcPeer = null;
   rtcReady = false;
-  serverVadAvailable = false;
-  serverVadSpeech = false;
-  serverVadAt = 0;
-  serverVadScore = 0;
   const oldPeerId = rtcPeerId;
   rtcPeerId = "";
   if (oldPeerId) {
@@ -455,10 +425,6 @@ const connectWebRtcPeer = async () => {
   });
   rtcPeer = pc;
   rtcReady = false;
-  serverVadAvailable = false;
-  serverVadSpeech = false;
-  serverVadAt = 0;
-  serverVadScore = 0;
 
   rtcDataChannel = pc.createDataChannel("audio_downlink");
   rtcDataChannel.onopen = () => {
@@ -475,8 +441,6 @@ const connectWebRtcPeer = async () => {
       const payload = JSON.parse(String(event.data || ""));
       if (payload?.type === "audio_chunk") {
         handleAudioChunkPayload(payload);
-      } else if (payload?.type === "vad_state") {
-        handleVadStatePayload(payload);
       }
     } catch (_) {
       // ignore malformed datachannel payload
@@ -898,15 +862,10 @@ const handleWsMessage = (payload) => {
     assistantDisplayText = "";
     pendingTranscript = "";
     lastTranscriptNorm = "";
-    bargeTranscriptCandidate = "";
-    bargeTranscriptAt = 0;
     gotAudioThisTurn = false;
     bargeRequested = false;
     playbackInterimText = "";
     playbackInterimAt = 0;
-    serverVadSpeech = false;
-    serverVadAt = 0;
-    serverVadScore = 0;
     if (payload.source === "query" && payload.query) {
       updateConversation(payload.query, "Searching best movies...");
       setStatus("Searching best movies...");
@@ -943,11 +902,6 @@ const handleWsMessage = (payload) => {
     return;
   }
 
-  if (type === "vad_state") {
-    handleVadStatePayload(payload);
-    return;
-  }
-
   if (type === "turn_complete") {
     markActivity();
     const completedSource = currentAssistantSource;
@@ -960,16 +914,11 @@ const handleWsMessage = (payload) => {
     transcriptBlockUntil = Date.now() + (completedSource === "greeting" ? 520 : 180);
     pendingTranscript = "";
     lastTranscriptNorm = "";
-    bargeTranscriptCandidate = "";
-    bargeTranscriptAt = 0;
     playbackInterimText = "";
     playbackInterimAt = 0;
     currentAssistantSource = "";
     awaitingTurn = false;
     bargeRequested = false;
-    serverVadSpeech = false;
-    serverVadAt = 0;
-    serverVadScore = 0;
     if (payload.end_session) {
       stopVoiceMode();
       return;
@@ -983,11 +932,6 @@ const handleWsMessage = (payload) => {
     awaitingTurn = false;
     bargeRequested = false;
     currentAssistantSource = "";
-    bargeTranscriptCandidate = "";
-    bargeTranscriptAt = 0;
-    serverVadSpeech = false;
-    serverVadAt = 0;
-    serverVadScore = 0;
     if (isVoiceMode) setListeningStatus();
     return;
   }
@@ -1104,18 +1048,6 @@ const computeRmsEnergy = () => {
   return Math.sqrt(sum / data.length);
 };
 
-const computePlaybackEnergy = () => {
-  if (!playbackAnalyser) return 0;
-  const data = new Uint8Array(playbackAnalyser.fftSize);
-  playbackAnalyser.getByteTimeDomainData(data);
-  let sum = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    const normalized = (data[i] - 128) / 128;
-    sum += normalized * normalized;
-  }
-  return Math.sqrt(sum / data.length);
-};
-
 const calibrateAmbientNoise = async (ms = VAD.calibrationMs) => {
   const started = Date.now();
   const samples = [];
@@ -1172,11 +1104,8 @@ const startSpeechRecognition = () => {
     lastDetectedLangHint = detectedHint;
     if (currentAssistantSource === "greeting" && inTranscriptBlock) return;
     if (assistantSpeaking() && !allowTranscriptDuringPlayback) {
-      // While assistant is speaking, keep only a barge candidate.
-      if (!inTranscriptBlock && !isLikelyAssistantEcho(text) && isMeaningfulAutoQuery(text)) {
-        bargeTranscriptCandidate = text;
-        bargeTranscriptAt = Date.now();
-      }
+      // Never accept recognizer transcript while assistant audio is active.
+      // Barge-in is handled by VAD stop logic, then transcript capture resumes.
       return;
     }
     if (inTranscriptBlock) return;
@@ -1297,47 +1226,22 @@ const processVadTick = () => {
       const warmup = audioStartedAt && now - audioStartedAt < 350;
       const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= VAD.bargeMinAudioMs;
       assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
-      const playbackEnergy = computePlaybackEnergy();
-      const playbackRef = Math.max(playbackEnergy, assistantEnergyFloor * 0.9, 0.00008);
-      const micToPlaybackRatio = energy / playbackRef;
       const bargeLevel = Math.max(
         dynamicEnergyThreshold * VAD.bargeDynamicMultiplier,
         assistantEnergyFloor * VAD.bargeAssistantFloorMultiplier
       );
       const strongVoice = energy > bargeLevel;
-      const clearMicLead = micToPlaybackRatio >= (VAD.bargeMinMicToPlaybackRatio || 1.35);
       if (!speakingSince) speakingSince = now;
       const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs;
       const strongVoiceOnly =
         now - speakingSince >= VAD.bargeStrongHoldMs && energy > bargeLevel * VAD.bargeStrongMultiplier;
-      const candidateFresh =
-        bargeTranscriptCandidate.trim().length >= 2 &&
-        now - bargeTranscriptAt <= 2300 &&
-        !isLikelyAssistantEcho(bargeTranscriptCandidate);
-      const transcriptGate = VAD.bargeRequireTranscript ? candidateFresh : candidateFresh || strongVoiceOnly;
-      const serverSpeechFresh = serverVadSpeech && now - serverVadAt <= 1300;
-      const requireServerVadGate = serverVadAvailable && !!rtcPeerId;
-      const serverVadGate = !requireServerVadGate || serverSpeechFresh;
       if (
         !warmup &&
         minPlaybackElapsed &&
         Date.now() >= suppressBargeUntil &&
         strongVoice &&
-        clearMicLead &&
-        transcriptGate &&
-        serverVadGate &&
         (sustainedVoice || strongVoiceOnly)
       ) {
-        if (candidateFresh) {
-          pendingTranscript = bargeTranscriptCandidate.trim();
-          lastTranscriptNorm = normalizeText(pendingTranscript);
-          updateConversation(pendingTranscript, convAgentText.textContent);
-        } else {
-          pendingTranscript = "";
-          lastTranscriptNorm = "";
-        }
-        bargeTranscriptCandidate = "";
-        bargeTranscriptAt = 0;
         stopAssistantPlayback(true);
         lastSpeechAt = Date.now();
         speakingSince = 0;
@@ -1354,10 +1258,6 @@ const processVadTick = () => {
   }
 
   speakingSince = 0;
-  if (bargeTranscriptCandidate && Date.now() - bargeTranscriptAt > 2600) {
-    bargeTranscriptCandidate = "";
-    bargeTranscriptAt = 0;
-  }
   if (
     pendingTranscript.trim() &&
     !assistantSpeaking() &&
@@ -1421,11 +1321,6 @@ const startVoiceMode = async () => {
   awaitingTurn = false;
   pendingTranscript = "";
   lastTranscriptNorm = "";
-  bargeTranscriptCandidate = "";
-  bargeTranscriptAt = 0;
-  serverVadSpeech = false;
-  serverVadAt = 0;
-  serverVadScore = 0;
   speakingSince = 0;
   lastSpeechAt = Date.now();
   lastActivityAt = Date.now();
@@ -1438,20 +1333,10 @@ const startVoiceMode = async () => {
   setListeningStatus();
 
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  micSourceNode = audioContext.createMediaStreamSource(stream);
+  const source = audioContext.createMediaStreamSource(stream);
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 1024;
-  micSourceNode.connect(analyser);
-  playbackAnalyser = audioContext.createAnalyser();
-  playbackAnalyser.fftSize = 1024;
-  try {
-    playbackSourceNode = audioContext.createMediaElementSource(audioPlayer);
-    playbackSourceNode.connect(playbackAnalyser);
-    playbackAnalyser.connect(audioContext.destination);
-  } catch (_) {
-    playbackSourceNode = null;
-    playbackAnalyser = null;
-  }
+  source.connect(analyser);
 
   startSpeechRecognition();
   await calibrateAmbientNoise();
@@ -1480,18 +1365,9 @@ const stopVoiceMode = () => {
   }
   audioContext = null;
   analyser = null;
-  playbackAnalyser = null;
-  micSourceNode = null;
-  playbackSourceNode = null;
   suppressBargeUntil = 0;
   transcriptBlockUntil = 0;
   lastAssistantUtterance = "";
-  bargeTranscriptCandidate = "";
-  bargeTranscriptAt = 0;
-  serverVadAvailable = false;
-  serverVadSpeech = false;
-  serverVadAt = 0;
-  serverVadScore = 0;
 
   isMicMuted = false;
   muteBtn.classList.remove("active");
