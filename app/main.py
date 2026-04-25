@@ -1,14 +1,16 @@
 import asyncio
 import base64
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import asynccontextmanager
 import json
+import logging
 import math
 import re
-from threading import Lock
 import time
 from urllib.parse import urlparse
 from uuid import uuid4
+
+_log = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -24,6 +26,7 @@ from app.services.llm_service import (
     SYSTEM_PROMPT,
     UNRELATED_REDIRECT_EN,
     UNRELATED_REDIRECT_HI,
+    build_conversation_messages,
     check_identity,
     detect_output_language,
     generate_conversation_text,
@@ -35,9 +38,12 @@ from app.services.llm_service import (
     is_small_talk_query,
     policy_response_for_query,
 )
+from app.services.deepgram_stt_service import DeepgramSTTService
+from app.services.query_preprocessor import QuerySlots, extract_slots
+from app.services.redis_session_store import RedisSessionStore
 from app.services.retriever import Retriever
 from app.services.runtime import AppServices
-from app.services.session_token import SessionTokenManager
+from app.services.session_token import GREETING_TEXT, SessionTokenManager
 from app.services.stt_service import STTService
 from app.services.tts_service import TTSService
 from app.services.webrtc_bridge import get_webrtc_bridge
@@ -58,6 +64,12 @@ async def lifespan(app: FastAPI):
         credits_csv_path=str(settings.credits_csv_path),
         embedding_model_name=settings.embedding_model_name,
     )
+    redis_store = RedisSessionStore(settings)
+    await redis_store.ping()  # Sets _enabled; does not raise on failure
+
+    # Deepgram STT — used when stt_provider == "deepgram"
+    deepgram_stt = DeepgramSTTService(settings) if settings.stt_provider == "deepgram" else None
+
     services = AppServices(
         settings=settings,
         retriever=retriever,
@@ -65,9 +77,24 @@ async def lifespan(app: FastAPI):
         stt=STTService(settings),
         tts=TTSService(settings),
         session_tokens=SessionTokenManager(settings),
+        redis_store=redis_store,
+        deepgram_stt=deepgram_stt,
     )
     app.state.services = services
+    app.state.greeting_audio_task = asyncio.create_task(
+        services.tts.ensure_named_audio(GREETING_TEXT, "greeting_prompt.mp3")
+    )
+    app.state.webrtc_cleanup_task = webrtc_bridge.start_cleanup_task()
     yield
+    greeting_task = getattr(app.state, "greeting_audio_task", None)
+    if greeting_task:
+        greeting_task.cancel()
+    cleanup_task = getattr(app.state, "webrtc_cleanup_task", None)
+    if cleanup_task:
+        cleanup_task.cancel()
+    if deepgram_stt:
+        await deepgram_stt.close_all()
+    await redis_store.close()
 
 
 settings = get_settings()
@@ -112,7 +139,7 @@ def _split_text_sentences(text: str) -> list[str]:
     return sentences
 
 
-def _coalesce_tts_chunks(parts: list[str], min_chars: int = 120, max_chars: int = 260) -> list[str]:
+def _coalesce_tts_chunks(parts: list[str], min_chars: int = 70, max_chars: int = 220) -> list[str]:
     chunks: list[str] = []
     current = ""
 
@@ -161,6 +188,17 @@ def _coalesce_tts_chunks(parts: list[str], min_chars: int = 120, max_chars: int 
     return chunks
 
 
+def _prepare_tts_units(text: str) -> list[str]:
+    parts = [part.strip() for part in _split_text_sentences(text) if part.strip()]
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return parts
+    first = parts[0]
+    rest = _coalesce_tts_chunks(parts[1:])
+    return [first, *rest]
+
+
 def _extract_origin_host(origin_value: str) -> str:
     raw = (origin_value or "").strip()
     if not raw:
@@ -187,7 +225,7 @@ def _is_same_origin_websocket(websocket: WebSocket) -> bool:
     return bool(host) and origin_host == host
 
 
-def _force_progressive_chunk(buffer: str, min_chars: int = 90, target_chars: int = 150) -> tuple[str, str]:
+def _force_progressive_chunk(buffer: str, min_chars: int = 55, target_chars: int = 105) -> tuple[str, str]:
     text = (buffer or "").strip()
     if len(text) < min_chars:
         return "", buffer
@@ -215,6 +253,8 @@ def _build_stream_messages(
     query: str,
     movies: list[dict],
     output_language: str | None = None,
+    slots: "QuerySlots | None" = None,
+    partial_context: str = "",
 ) -> list[dict]:
     movie_lines = []
     for i, movie in enumerate(movies, start=1):
@@ -226,7 +266,10 @@ def _build_stream_messages(
 
     lang = output_language if output_language in {"en", "hi"} else detect_output_language(query)
     language_rule = (
-        "Respond in Hindi using Devanagari script only."
+        "Respond in Hindi using Devanagari script only. "
+        "CRITICAL: even if the user query is written in Roman/Hinglish letters, your ENTIRE response must be in Devanagari. "
+        "Wrong example: 'Kya aap Inception dekhna chahenge?' "
+        "Right example: 'क्या आप Inception देखना चाहेंगे?'"
         if lang == "hi"
         else "Respond in English."
     )
@@ -236,10 +279,16 @@ def _build_stream_messages(
         "Do not bias recommendations by movie language unless the user explicitly asks for a movie language. "
         "Keep it concise and natural for voice."
     )
+    slot_hint = ""
+    if slots and not slots.is_empty():
+        slot_hint = f"[Structured context: {slots.to_context_string()}]\n"
+    partial_hint = f"[Early context from partial speech: {partial_context}]\n" if partial_context else ""
     user_prompt = (
+        f"{partial_hint}{slot_hint}"
         f"User query: {query}\n\n"
         f"Candidate movies:\n{chr(10).join(movie_lines)}\n\n"
         f"{language_rule}\n"
+        "Every Hindi word must be in Devanagari script. Never write Hindi in Roman letters. "
         "Start with one short opening line. "
         "Recommend exactly two movies from the candidates. "
         "Give one short sentence per movie. "
@@ -275,7 +324,23 @@ async def _send_audio_payload(
     await _send_json_locked(websocket, send_lock, payload)
 
 
-async def _tts_sentence_to_b64(services: AppServices, sentence: str) -> str | None:
+async def _cached_audio_b64(audio_path) -> str | None:
+    try:
+        if not audio_path.exists():
+            return None
+        audio_bytes = await asyncio.to_thread(audio_path.read_bytes)
+        if not audio_bytes:
+            return None
+        return base64.b64encode(audio_bytes).decode("ascii")
+    except Exception:
+        return None
+
+
+async def _tts_sentence_to_b64(
+    services: AppServices,
+    sentence: str,
+    output_language: str | None = None,
+) -> str | None:
     text = (sentence or "").strip()
     if not text:
         return None
@@ -283,32 +348,39 @@ async def _tts_sentence_to_b64(services: AppServices, sentence: str) -> str | No
     if not client:
         return None
 
-    output_path = services.settings.audio_path / f"ws_{uuid4().hex}.mp3"
     try:
         speed = min(2.0, max(0.8, float(services.settings.openai_tts_speed or 1.0)))
+        # Cap Hindi at 1.35× — natural conversational pace with clear pronunciation
+        if output_language == "hi":
+            speed = min(speed, 1.35)
         request_payload = {
             "model": services.settings.openai_tts_model,
             "voice": services.settings.openai_tts_voice,
             "input": text,
             "speed": speed,
         }
-        instructions = (services.settings.openai_tts_instructions or "").strip()
+        if output_language == "hi":
+            instructions = (
+                "आप Luma हैं — एक जोशीली, दोस्ताना मूवी गाइड। "
+                "बोलने का अंदाज़ ऐसा हो जैसे किसी दोस्त से बात हो — पढ़ने जैसा नहीं। "
+                "फिल्म का नाम थोड़ा धीरे और साफ़ बोलें, फिर आगे की बात तेज़ रखें। "
+                "सवाल पूछते वक्त थोड़ी जिज्ञासा हो आवाज़ में।"
+            )
+        else:
+            instructions = (services.settings.openai_tts_instructions or "").strip()
         if instructions:
             request_payload["instructions"] = instructions
 
+        # Use in-memory synthesis: no disk write/read round-trip
         try:
-            async with client.audio.speech.with_streaming_response.create(**request_payload) as response:
-                await response.stream_to_file(output_path)
+            response = await client.audio.speech.create(**request_payload)
         except TypeError:
             request_payload.pop("instructions", None)
-            async with client.audio.speech.with_streaming_response.create(**request_payload) as response:
-                await response.stream_to_file(output_path)
-        audio_bytes = await asyncio.to_thread(output_path.read_bytes)
-        return base64.b64encode(audio_bytes).decode("ascii")
+            response = await client.audio.speech.create(**request_payload)
+        return base64.b64encode(response.content).decode("ascii")
     except Exception:
+        _log.exception("TTS synthesis failed for sentence (%.40s)", text)
         return None
-    finally:
-        await asyncio.to_thread(lambda: output_path.unlink(missing_ok=True))
 
 
 async def _stream_llm_deltas(services: AppServices, messages: list[dict]):
@@ -319,6 +391,7 @@ async def _stream_llm_deltas(services: AppServices, messages: list[dict]):
                 model=services.settings.openai_chat_model,
                 messages=messages,
                 temperature=0.5,
+                max_tokens=250,
                 stream=True,
             )
             async for chunk in stream:
@@ -329,45 +402,12 @@ async def _stream_llm_deltas(services: AppServices, messages: list[dict]):
                     yield delta
             return
         except Exception:
-            pass
+            _log.exception("LLM stream failed; falling back to generate_messages")
 
     fallback = await services.llm.generate_messages(messages)
     if fallback:
         yield fallback
 
-
-async def _tts_worker(
-    websocket: WebSocket,
-    send_lock: asyncio.Lock,
-    services: AppServices,
-    sentence_queue: asyncio.Queue,
-    cancel_event: asyncio.Event,
-    peer_id: str | None = None,
-) -> None:
-    index = 0
-    while True:
-        sentence = await sentence_queue.get()
-        try:
-            if sentence is None:
-                return
-            if cancel_event.is_set():
-                continue
-            audio_b64 = await _tts_sentence_to_b64(services, str(sentence))
-            if audio_b64 and not cancel_event.is_set():
-                await _send_audio_payload(
-                    websocket,
-                    send_lock,
-                    peer_id,
-                    {
-                        "type": "audio_chunk",
-                        "index": index,
-                        "sentence": sentence,
-                        "audio_b64": audio_b64,
-                    },
-                )
-                index += 1
-        finally:
-            sentence_queue.task_done()
 
 
 async def _send_text_with_chunked_tts(
@@ -376,17 +416,42 @@ async def _send_text_with_chunked_tts(
     services: AppServices,
     text: str,
     cancel_event: asyncio.Event,
+    output_language: str | None = None,
     peer_id: str | None = None,
 ) -> str:
     normalized = (text or "").strip()
     if not normalized:
         return ""
-    await _send_json_locked(websocket, send_lock, {"type": "text_delta", "delta": normalized})
-    units = _coalesce_tts_chunks(_split_text_sentences(normalized))
+    units = _prepare_tts_units(normalized)
+    if not units:
+        await _send_json_locked(websocket, send_lock, {"type": "text_delta", "delta": normalized})
+        return normalized
+
+    # Send all text deltas immediately so the user sees text without waiting for TTS
     for idx, sentence in enumerate(units):
         if cancel_event.is_set():
+            return normalized
+        display_delta = sentence if idx == 0 else f"\n\n{sentence}"
+        await _send_json_locked(websocket, send_lock, {"type": "text_delta", "delta": display_delta})
+
+    if cancel_event.is_set():
+        return normalized
+
+    # Launch all TTS requests concurrently — total wait is max(individual), not sum
+    tts_tasks = [
+        asyncio.create_task(
+            _tts_sentence_to_b64(services, sentence, output_language=output_language)
+        )
+        for sentence in units
+    ]
+
+    # Send audio chunks in order as each task completes
+    for idx, (sentence, task) in enumerate(zip(units, tts_tasks)):
+        if cancel_event.is_set():
+            for t in tts_tasks:
+                t.cancel()
             break
-        audio_b64 = await _tts_sentence_to_b64(services, sentence)
+        audio_b64 = await task
         if audio_b64 and not cancel_event.is_set():
             await _send_audio_payload(
                 websocket,
@@ -418,8 +483,21 @@ async def _process_voice_turn(
         await _send_json_locked(websocket, send_lock, {"type": "error", "detail": exc.detail})
         return session_token
 
+    # Load conversation history from Redis (falls back to empty list if Redis unavailable)
+    redis: RedisSessionStore | None = getattr(services, "redis_store", None)
+    if redis and redis._enabled:
+        state.history = await redis.load(state.session_id)
+
+    # Consume any partial transcript context accumulated while user was speaking
+    partial_context = ""
+    if redis and redis._enabled:
+        partial_context = await redis.get_partial(state.session_id)
+        if partial_context:
+            await redis.clear_partial(state.session_id)
+
     user_query = (query or "").strip()
     user_lang = detect_output_language(user_query, lang_hint=lang_hint)
+    slots = extract_slots(user_query)
     if not user_query:
         await _send_json_locked(websocket, send_lock, {"type": "error", "detail": "query is required"})
         return session_token
@@ -438,6 +516,7 @@ async def _process_voice_turn(
     full_text = ""
     end_session = False
     should_stream_llm = False
+    stream_messages: list[dict] | None = None
 
     if _is_kill_phrase(user_query):
         end_session = True
@@ -456,18 +535,20 @@ async def _process_voice_turn(
                 else:
                     full_text = policy_text
             elif is_small_talk_query(user_query):
-                full_text = await generate_conversation_text(
-                    llm=services.llm,
+                should_stream_llm = True
+                stream_messages = build_conversation_messages(
                     query=user_query,
                     history=state.history,
                     output_language=user_lang,
+                    slots=slots,
                 )
             elif not is_recommendation_intent(user_query):
-                full_text = await generate_conversation_text(
-                    llm=services.llm,
+                should_stream_llm = True
+                stream_messages = build_conversation_messages(
                     query=user_query,
                     history=state.history,
                     output_language=user_lang,
+                    slots=slots,
                 )
             else:
                 retrieved = await services.retriever.retrieve(user_query, top_k=services.settings.top_k)
@@ -482,7 +563,16 @@ async def _process_voice_turn(
                         },
                     )
                 should_stream_llm = bool(movies)
-                if not should_stream_llm:
+                if should_stream_llm:
+                    stream_messages = _build_stream_messages(
+                        state.history,
+                        user_query,
+                        movies,
+                        output_language=user_lang,
+                        slots=slots,
+                        partial_context=partial_context,
+                    )
+                else:
                     full_text = await generate_grounded_recommendation_text(
                         llm=services.llm,
                         query=user_query,
@@ -492,40 +582,89 @@ async def _process_voice_turn(
                     )
 
     if should_stream_llm:
-        messages = _build_stream_messages(
-            state.history,
-            user_query,
-            movies,
+        messages = stream_messages or build_conversation_messages(
+            query=user_query,
+            history=state.history,
             output_language=user_lang,
         )
-        sentence_queue: asyncio.Queue = asyncio.Queue()
-        tts_task = asyncio.create_task(
-            _tts_worker(
-                websocket=websocket,
-                send_lock=send_lock,
-                services=services,
-                sentence_queue=sentence_queue,
-                cancel_event=cancel_event,
-                peer_id=peer_id,
-            )
-        )
+        # tts_futures: ordered list of (sentence_text, asyncio.Task[audio_b64|None]).
+        # Tasks are spawned as each sentence arrives from the LLM stream.
+        # A concurrent drain task sends audio in order as each TTS task completes,
+        # so the user hears the first sentence while the LLM is still generating the rest.
+        tts_futures: list[tuple[str, "asyncio.Task[str | None]"]] = []
+        llm_done = asyncio.Event()
         buffer = ""
         streamed_text = ""
         tts_parts: list[str] = []
         tts_chars = 0
+        first_dispatched = False
         last_emit_at = time.monotonic()
+
+        def _dispatch_tts_unit(unit: str) -> None:
+            nonlocal first_dispatched
+            text = unit.strip()
+            if not text:
+                return
+            task: asyncio.Task[str | None] = asyncio.create_task(
+                _tts_sentence_to_b64(services, text, output_language=user_lang)
+            )
+            tts_futures.append((text, task))
+            first_dispatched = True
 
         async def flush_tts_parts(force: bool = False) -> None:
             nonlocal tts_parts, tts_chars
             if not tts_parts:
                 return
-            if not force and tts_chars < 120:
+            # Fast-path: dispatch first unit immediately regardless of size
+            if not first_dispatched:
+                first_unit = tts_parts.pop(0).strip()
+                tts_chars = sum(len(p) for p in tts_parts)
+                if first_unit:
+                    _dispatch_tts_unit(first_unit)
+                if not tts_parts:
+                    return
+            if not force and tts_chars < 60:
                 return
-            units = _coalesce_tts_chunks(tts_parts)
-            for unit in units:
-                await sentence_queue.put(unit)
+            for unit in _coalesce_tts_chunks(tts_parts):
+                _dispatch_tts_unit(unit)
             tts_parts = []
             tts_chars = 0
+
+        async def _drain_tts() -> None:
+            """Send audio chunks in order as TTS tasks complete — runs concurrently with LLM stream."""
+            audio_index = 0
+            sent_up_to = 0
+            while True:
+                if cancel_event.is_set():
+                    break
+                if sent_up_to < len(tts_futures):
+                    sentence, task = tts_futures[sent_up_to]
+                    try:
+                        audio_b64 = await task
+                    except asyncio.CancelledError:
+                        break
+                    except Exception:
+                        audio_b64 = None
+                    sent_up_to += 1
+                    if audio_b64 and not cancel_event.is_set():
+                        await _send_audio_payload(
+                            websocket,
+                            send_lock,
+                            peer_id,
+                            {
+                                "type": "audio_chunk",
+                                "index": audio_index,
+                                "sentence": sentence,
+                                "audio_b64": audio_b64,
+                            },
+                        )
+                        audio_index += 1
+                elif llm_done.is_set():
+                    break
+                else:
+                    await asyncio.sleep(0.02)  # wait for more TTS tasks to be dispatched
+
+        drain_task = asyncio.create_task(_drain_tts())
 
         try:
             async for delta in _stream_llm_deltas(services, messages):
@@ -541,10 +680,9 @@ async def _process_voice_turn(
                 if ready:
                     await flush_tts_parts(force=False)
                     last_emit_at = time.monotonic()
-
                 if not ready:
                     now = time.monotonic()
-                    if len(buffer.strip()) >= 95 and now - last_emit_at >= 0.45:
+                    if len(buffer.strip()) >= 55 and now - last_emit_at >= 0.22:
                         early, buffer = _force_progressive_chunk(buffer)
                         if early:
                             tts_parts.append(early)
@@ -556,10 +694,19 @@ async def _process_voice_turn(
                 tts_parts.append(buffer.strip())
                 tts_chars += len(buffer.strip())
             await flush_tts_parts(force=True)
+        except Exception:
+            _log.exception("LLM streaming loop failed")
         finally:
-            await sentence_queue.put(None)
-            await sentence_queue.join()
-            await tts_task
+            llm_done.set()
+            if cancel_event.is_set():
+                drain_task.cancel()
+                for _, t in tts_futures:
+                    t.cancel()
+
+        try:
+            await drain_task
+        except asyncio.CancelledError:
+            pass
 
         full_text = streamed_text.strip()
         if not full_text and not cancel_event.is_set():
@@ -576,6 +723,7 @@ async def _process_voice_turn(
                 services,
                 full_text,
                 cancel_event,
+                output_language=user_lang,
                 peer_id=peer_id,
             )
     else:
@@ -585,6 +733,7 @@ async def _process_voice_turn(
             services,
             full_text,
             cancel_event,
+            output_language=user_lang,
             peer_id=peer_id,
         )
 
@@ -607,7 +756,16 @@ async def _process_voice_turn(
         )
         return ""
 
-    _, new_token = services.session_tokens.update_history(session_token, user_query, full_text)
+    # Persist history to Redis; re-encode a thin JWT to slide the expiry window
+    updated_history = list(state.history)
+    if user_query:
+        updated_history.append({"role": "user", "content": user_query})
+    if full_text:
+        updated_history.append({"role": "assistant", "content": full_text})
+    updated_history = updated_history[-services.settings.session_max_messages:]
+    if redis and redis._enabled:
+        await redis.save(state.session_id, updated_history, services.settings.session_ttl_minutes)
+    new_token = services.session_tokens.encode(state.session_id)
     await _send_json_locked(
         websocket,
         send_lock,
@@ -659,9 +817,9 @@ app.mount("/static", StaticFiles(directory=str(settings.static_path)), name="sta
 if settings.is_production:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts_list or ["*"])
 
-_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
-_rate_lock = Lock()
-_ws_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+_rate_buckets: dict[str, deque[float]] = {}
+_rate_lock = asyncio.Lock()
+_ws_rate_buckets: dict[str, deque[float]] = {}
 
 
 @app.middleware("http")
@@ -671,10 +829,12 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "microphone=(self), geolocation=(), camera=()"
+    # Allow ws: only in dev so browsers can connect to localhost; production requires wss:
+    ws_origins = "wss:" if settings.is_production else "ws: wss:"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; img-src 'self' https: data:; media-src 'self' https: blob: data:; "
         "script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' https: data:; "
-        "connect-src 'self' ws: wss:; frame-ancestors 'none'"
+        f"connect-src 'self' {ws_origins}; frame-ancestors 'none'"
     )
     if settings.is_production:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
@@ -704,16 +864,22 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
         now = time.time()
         ip = request.client.host if request.client else "unknown"
         key = f"{ip}:{method}:{path}"
-        with _rate_lock:
-            bucket = _rate_buckets[key]
-            while bucket and now - bucket[0] > settings.rate_limit_window_sec:
+        async with _rate_lock:
+            bucket = _rate_buckets.get(key)
+            if bucket is None:
+                bucket = deque()
+                _rate_buckets[key] = bucket
+            while bucket and now - bucket[0] >= settings.rate_limit_window_sec:
                 bucket.popleft()
-            if len(bucket) >= limit:
+            if not bucket:
+                _rate_buckets.pop(key, None)
+            elif len(bucket) >= limit:
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "Rate limit exceeded. Please retry shortly."},
                 )
-            bucket.append(now)
+            else:
+                bucket.append(now)
 
     return await call_next(request)
 
@@ -752,7 +918,8 @@ async def webrtc_close(peer_id: str) -> dict:
 @app.websocket("/ws/voice")
 async def ws_voice(websocket: WebSocket) -> None:
     if settings.app_api_key:
-        provided = (websocket.headers.get("x-api-key", "") or websocket.query_params.get("api_key", "")).strip()
+        # Accept the key via header only — query params appear in server logs and browser history.
+        provided = websocket.headers.get("x-api-key", "").strip()
         same_origin = _is_same_origin_websocket(websocket)
         if not same_origin and provided != settings.app_api_key:
             await websocket.close(code=4401)
@@ -834,18 +1001,41 @@ async def ws_voice(websocket: WebSocket) -> None:
                 await cancel_active_turn()
                 active_cancel_event = asyncio.Event()
                 token_snapshot = current_session_token
+                # Snapshot peer_id by value so the closure isn't affected by later mutations
+                peer_id_snapshot = current_peer_id
 
-                async def run_greeting_turn() -> None:
+                async def run_greeting_turn(
+                    _pid: str = peer_id_snapshot,
+                    _cancel: asyncio.Event = active_cancel_event,
+                ) -> None:
                     await _send_json_locked(websocket, send_lock, {"type": "turn_started", "source": "greeting"})
-                    spoken_text = await _send_text_with_chunked_tts(
-                        websocket=websocket,
-                        send_lock=send_lock,
-                        services=services,
-                        text=greeting_text,
-                        cancel_event=active_cancel_event,
-                        peer_id=current_peer_id,
-                    )
-                    if active_cancel_event.is_set():
+                    spoken_text = greeting_text.strip()
+                    greeting_path = services.settings.audio_path / "greeting_prompt.mp3"
+                    greeting_audio_b64 = await _cached_audio_b64(greeting_path)
+                    if greeting_audio_b64:
+                        await _send_json_locked(websocket, send_lock, {"type": "text_delta", "delta": spoken_text})
+                        await _send_audio_payload(
+                            websocket,
+                            send_lock,
+                            _pid,
+                            {
+                                "type": "audio_chunk",
+                                "index": 0,
+                                "sentence": spoken_text,
+                                "audio_b64": greeting_audio_b64,
+                            },
+                        )
+                    else:
+                        spoken_text = await _send_text_with_chunked_tts(
+                            websocket=websocket,
+                            send_lock=send_lock,
+                            services=services,
+                            text=greeting_text,
+                            cancel_event=_cancel,
+                            output_language="en",
+                            peer_id=_pid,
+                        )
+                    if _cancel.is_set():
                         await _send_json_locked(websocket, send_lock, {"type": "turn_cancelled"})
                         return
                     await _send_json_locked(
@@ -882,24 +1072,35 @@ async def ws_voice(websocket: WebSocket) -> None:
                 if not query:
                     continue
                 now = time.time()
-                with _rate_lock:
-                    bucket = _ws_rate_buckets[f"{client_ip}:ws:user_query"]
-                    while bucket and now - bucket[0] > services.settings.rate_limit_window_sec:
-                        bucket.popleft()
-                    if len(bucket) >= services.settings.rate_limit_voice_per_window:
+                ws_query_key = f"{client_ip}:ws:user_query"
+                async with _rate_lock:
+                    ws_bucket = _ws_rate_buckets.get(ws_query_key)
+                    if ws_bucket is None:
+                        ws_bucket = deque()
+                        _ws_rate_buckets[ws_query_key] = ws_bucket
+                    while ws_bucket and now - ws_bucket[0] >= services.settings.rate_limit_window_sec:
+                        ws_bucket.popleft()
+                    if not ws_bucket:
+                        _ws_rate_buckets.pop(ws_query_key, None)
+                    elif len(ws_bucket) >= services.settings.rate_limit_voice_per_window:
                         await _send_json_locked(
                             websocket,
                             send_lock,
                             {"type": "error", "detail": "Rate limit exceeded. Please retry shortly."},
                         )
                         continue
-                    bucket.append(now)
+                    else:
+                        ws_bucket.append(now)
 
                 await cancel_active_turn()
                 active_cancel_event = asyncio.Event()
                 token_snapshot = current_session_token
+                peer_id_snapshot = current_peer_id
 
-                async def run_turn() -> None:
+                async def run_turn(
+                    _pid: str = peer_id_snapshot,
+                    _cancel: asyncio.Event = active_cancel_event,
+                ) -> None:
                     nonlocal current_session_token
                     new_token = await _process_voice_turn(
                         websocket=websocket,
@@ -907,9 +1108,9 @@ async def ws_voice(websocket: WebSocket) -> None:
                         services=services,
                         session_token=token_snapshot,
                         query=query,
-                        cancel_event=active_cancel_event,
+                        cancel_event=_cancel,
                         lang_hint=lang_hint,
-                        peer_id=current_peer_id,
+                        peer_id=_pid,
                     )
                     current_session_token = new_token
 
@@ -950,35 +1151,64 @@ async def ws_voice(websocket: WebSocket) -> None:
                     continue
 
                 now = time.time()
-                with _rate_lock:
-                    bucket = _ws_rate_buckets[f"{client_ip}:ws:user_audio"]
-                    while bucket and now - bucket[0] > services.settings.rate_limit_window_sec:
-                        bucket.popleft()
-                    if len(bucket) >= services.settings.rate_limit_voice_per_window:
+                ws_audio_key = f"{client_ip}:ws:user_audio"
+                async with _rate_lock:
+                    ws_bucket = _ws_rate_buckets.get(ws_audio_key)
+                    if ws_bucket is None:
+                        ws_bucket = deque()
+                        _ws_rate_buckets[ws_audio_key] = ws_bucket
+                    while ws_bucket and now - ws_bucket[0] >= services.settings.rate_limit_window_sec:
+                        ws_bucket.popleft()
+                    if not ws_bucket:
+                        _ws_rate_buckets.pop(ws_audio_key, None)
+                    elif len(ws_bucket) >= services.settings.rate_limit_voice_per_window:
                         await _send_json_locked(
                             websocket,
                             send_lock,
                             {"type": "error", "detail": "Rate limit exceeded. Please retry shortly."},
                         )
                         continue
-                    bucket.append(now)
+                    else:
+                        ws_bucket.append(now)
 
                 await cancel_active_turn()
                 active_cancel_event = asyncio.Event()
                 token_snapshot = current_session_token
+                peer_id_snapshot = current_peer_id
                 ext = _audio_extension_from_mime(mime_type)
 
-                async def run_audio_turn() -> None:
+                async def run_audio_turn(
+                    _pid: str = peer_id_snapshot,
+                    _cancel: asyncio.Event = active_cancel_event,
+                ) -> None:
                     nonlocal current_session_token
-                    try:
-                        query = await services.stt.transcribe_bytes(audio_bytes, filename=f"ws_input{ext}")
-                    except HTTPException as exc:
-                        await _send_json_locked(
-                            websocket,
-                            send_lock,
-                            {"type": "error", "detail": exc.detail},
-                        )
-                        return
+                    # Try Deepgram stream first (already accumulating since first chunk)
+                    query = ""
+                    _dg: DeepgramSTTService | None = getattr(services, "deepgram_stt", None)
+                    if _dg and _dg._client:
+                        try:
+                            _sid = services.session_tokens.decode(token_snapshot).session_id
+                        except Exception:
+                            _sid = ""
+                        if _sid and _dg.has_open_stream(_sid):
+                            # Send the final full blob too so nothing is missed
+                            await _dg.send_chunk(_sid, audio_bytes)
+                            query = await _dg.close_stream(_sid)
+
+                    # Fallback: send full blob to Whisper if Deepgram gave nothing
+                    if not query:
+                        try:
+                            query = await services.stt.transcribe_bytes(
+                                audio_bytes, filename=f"ws_input{ext}", lang_hint=lang_hint
+                            )
+                        except HTTPException as exc:
+                            await _send_json_locked(
+                                websocket,
+                                send_lock,
+                                {"type": "error", "detail": exc.detail},
+                            )
+                            return
+
                     query = (query or "").strip()
                     if not query:
                         await _send_json_locked(
@@ -993,16 +1223,153 @@ async def ws_voice(websocket: WebSocket) -> None:
                         services=services,
                         session_token=token_snapshot,
                         query=query,
-                        cancel_event=active_cancel_event,
+                        cancel_event=_cancel,
                         lang_hint=lang_hint,
-                        peer_id=current_peer_id,
+                        peer_id=_pid,
                     )
                     current_session_token = new_token
 
                 active_turn_task = asyncio.create_task(run_audio_turn())
 
+            elif msg_type == "utterance_start":
+                # WebRTC uplink: signal server to begin buffering PCM from the audio track
+                if services.settings.enable_webrtc_uplink and current_peer_id:
+                    await webrtc_bridge.start_utterance(current_peer_id)
+
+            elif msg_type == "utterance_end":
+                # WebRTC uplink: user stopped speaking — pull buffered PCM, convert to WAV, run STT
+                if not services.settings.enable_webrtc_uplink:
+                    continue
+                uplink_peer_id = str(payload.get("peer_id", current_peer_id)).strip()
+                lang_hint = str(payload.get("lang_hint", "en")).strip()
+                token_up = str(payload.get("session_token", current_session_token)).strip()
+
+                result = await webrtc_bridge.end_utterance(uplink_peer_id)
+                if not result:
+                    await _send_json_locked(
+                        websocket, send_lock,
+                        {"type": "error", "detail": "no audio buffered from WebRTC uplink"},
+                    )
+                    continue
+
+                wav_bytes, _sr, _ch = result
+                if not wav_bytes or len(wav_bytes) < 200:
+                    await _send_json_locked(
+                        websocket, send_lock,
+                        {"type": "error", "detail": "WebRTC audio too short"},
+                    )
+                    continue
+
+                await cancel_active_turn()
+                active_cancel_event = asyncio.Event()
+                token_snapshot = token_up or current_session_token
+                peer_id_snapshot = uplink_peer_id or current_peer_id
+
+                async def run_webrtc_audio_turn(
+                    _pid: str = peer_id_snapshot,
+                    _cancel: asyncio.Event = active_cancel_event,
+                    _wav: bytes = wav_bytes,
+                    _lang: str = lang_hint,
+                    _tok: str = token_snapshot,
+                ) -> None:
+                    nonlocal current_session_token
+                    # Try Deepgram stream first (chunks already streamed via audio_chunk_partial)
+                    query = ""
+                    _dg: DeepgramSTTService | None = getattr(services, "deepgram_stt", None)
+                    if _dg and _dg._client:
+                        try:
+                            _sid = services.session_tokens.decode(_tok).session_id
+                        except Exception:
+                            _sid = ""
+                        if _sid and _dg.has_open_stream(_sid):
+                            await _dg.send_chunk(_sid, _wav)
+                            query = await _dg.close_stream(_sid)
+
+                    # Fallback to Whisper with the buffered WAV
+                    if not query:
+                        try:
+                            query = await services.stt.transcribe_bytes(
+                                _wav, filename="uplink.wav", lang_hint=_lang
+                            )
+                        except HTTPException as exc:
+                            await _send_json_locked(
+                                websocket, send_lock,
+                                {"type": "error", "detail": exc.detail},
+                            )
+                            return
+                    query = (query or "").strip()
+                    if not query:
+                        await _send_json_locked(
+                            websocket, send_lock,
+                            {"type": "error", "detail": "could not transcribe WebRTC audio"},
+                        )
+                        return
+                    new_token = await _process_voice_turn(
+                        websocket=websocket,
+                        send_lock=send_lock,
+                        services=services,
+                        session_token=_tok,
+                        query=query,
+                        cancel_event=_cancel,
+                        lang_hint=_lang,
+                        peer_id=_pid,
+                    )
+                    current_session_token = new_token
+
+                active_turn_task = asyncio.create_task(run_webrtc_audio_turn())
+
+            elif msg_type == "audio_chunk_partial":
+                if not services.settings.partial_stt_enabled or not current_session_token:
+                    pass
+                else:
+                    _audio_b64 = str(payload.get("audio_b64", "")).strip()
+                    _lang = str(payload.get("lang_hint", "en")).strip().lower()
+                    if _lang not in {"hi", "en"}:
+                        _lang = "en"
+                    try:
+                        _chunk_bytes = base64.b64decode(_audio_b64 + "==")
+                    except Exception:
+                        _chunk_bytes = b""
+                    if len(_chunk_bytes) >= 600:
+                        _dg: DeepgramSTTService | None = getattr(services, "deepgram_stt", None)
+                        if _dg and _dg._client:
+                            # Deepgram path: open a stream on first chunk, then feed subsequent chunks
+                            try:
+                                _sid = services.session_tokens.decode(current_session_token).session_id
+                            except Exception:
+                                _sid = ""
+                            if _sid:
+                                if not _dg.has_open_stream(_sid):
+                                    asyncio.create_task(_dg.open_stream(_sid, _lang))
+                                else:
+                                    asyncio.create_task(_dg.send_chunk(_sid, _chunk_bytes))
+                        else:
+                            # OpenAI fallback: partial Whisper calls accumulated in Redis
+                            _redis = getattr(services, "redis_store", None)
+                            try:
+                                _sid = services.session_tokens.decode(current_session_token).session_id
+                            except Exception:
+                                _sid = ""
+                            if _sid and _redis and _redis._enabled:
+                                async def _run_partial(_b=_chunk_bytes, _l=_lang, _s=_sid):
+                                    partial = await services.stt.transcribe_partial(_b, "partial.webm", _l)
+                                    if partial:
+                                        existing = await _redis.get_partial(_s) or ""
+                                        combined = f"{existing} {partial}".strip()[-400:]
+                                        await _redis.set_partial(_s, combined, services.settings.partial_stt_chunk_ttl_sec)
+                                asyncio.create_task(_run_partial())
+
             elif msg_type == "barge_in":
                 await cancel_active_turn()
+                # Close any open Deepgram stream — new utterance will open a fresh one
+                _dg_bi: DeepgramSTTService | None = getattr(services, "deepgram_stt", None)
+                if _dg_bi and current_session_token:
+                    try:
+                        _sid_bi = services.session_tokens.decode(current_session_token).session_id
+                        if _dg_bi.has_open_stream(_sid_bi):
+                            asyncio.create_task(_dg_bi.close_stream(_sid_bi))
+                    except Exception:
+                        pass
                 await _send_json_locked(websocket, send_lock, {"type": "barge_in_ack"})
 
             elif msg_type == "ping":

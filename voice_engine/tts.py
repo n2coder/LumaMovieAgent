@@ -9,13 +9,11 @@ from uuid import uuid4
 from fastapi import HTTPException
 from openai import AsyncOpenAI
 
-from app.config import Settings
+from voice_engine.config import VoiceSettings as Settings
 
 _log = logging.getLogger(__name__)
 _CLEANUP_INTERVAL_SEC = 60.0
 
-# In-flight deduplication: text_hash → asyncio.Event so concurrent requests for
-# the same text wait for the first one to finish rather than all hitting the API.
 _in_flight: dict[str, asyncio.Event] = {}
 
 
@@ -26,7 +24,6 @@ class TTSService:
         self._last_cleanup_at: float = 0.0
 
     def _cache_key(self, text: str) -> str:
-        """Stable filename for a given text+voice+speed combo."""
         fingerprint = f"{text}|{self.settings.openai_tts_voice}|{self.settings.openai_tts_speed}|{self.settings.openai_tts_model}"
         return hashlib.md5(fingerprint.encode()).hexdigest()
 
@@ -39,11 +36,9 @@ class TTSService:
         cache_key = self._cache_key(text)
         cached_path = Path(self.settings.audio_path) / f"{cache_key}.mp3"
 
-        # Return immediately if already on disk
         if cached_path.exists() and cached_path.stat().st_size > 0:
             return f"/static/audio/{cache_key}.mp3"
 
-        # Deduplication: if another coroutine is already synthesizing this text, wait for it
         if cache_key in _in_flight:
             await _in_flight[cache_key].wait()
             if cached_path.exists() and cached_path.stat().st_size > 0:

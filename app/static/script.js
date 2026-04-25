@@ -20,58 +20,71 @@ const PAGE_API_KEY = new URLSearchParams(window.location.search).get("api_key") 
 
 const PLATFORM_VAD_CONFIG = {
   desktop: {
-    silenceMs: 950,
+    silenceMs: 700,
     vadIntervalMs: 100,
-    bargeHoldMs: 70,
-    bargeStrongHoldMs: 120,
-    bargeMinAudioMs: 120,
-    energyBase: 0.0015,
-    calibrationMs: 700,
-    calibrationMultiplier: 1.08,
-    echoSuppressMs: 260,
-    bargeDynamicMultiplier: 1.04,
-    bargeAssistantFloorMultiplier: 1.16,
-    bargeStrongMultiplier: 1.03,
-  },
-  android: {
-    silenceMs: 1050,
-    vadIntervalMs: 100,
-    bargeHoldMs: 78,
-    bargeStrongHoldMs: 130,
-    bargeMinAudioMs: 140,
-    energyBase: 0.0012,
-    calibrationMs: 900,
-    calibrationMultiplier: 1.06,
-    echoSuppressMs: 300,
-    bargeDynamicMultiplier: 1.05,
-    bargeAssistantFloorMultiplier: 1.18,
-    bargeStrongMultiplier: 1.04,
-  },
-  ios: {
-    silenceMs: 1100,
-    vadIntervalMs: 100,
-    bargeHoldMs: 82,
+    bargeHoldMs: 80,
     bargeStrongHoldMs: 140,
     bargeMinAudioMs: 150,
-    energyBase: 0.0011,
-    calibrationMs: 1000,
-    calibrationMultiplier: 1.08,
-    echoSuppressMs: 320,
+    energyBase: 0.002,
+    calibrationMs: 700,
+    calibrationMultiplier: 1.18,
+    echoSuppressMs: 300,
     bargeDynamicMultiplier: 1.06,
-    bargeAssistantFloorMultiplier: 1.2,
+    bargeAssistantFloorMultiplier: 1.12,
     bargeStrongMultiplier: 1.05,
+    voiceRatioThreshold: 0.40,
+    // Multi-tier VAD: max burst ms to classify as backchannel; min sustained ms for full barge-in
+    backchannelMaxMs: 350,
+    bargeInMinMs: 1500,
+  },
+  android: {
+    silenceMs: 750,
+    vadIntervalMs: 100,
+    bargeHoldMs: 90,
+    bargeStrongHoldMs: 150,
+    bargeMinAudioMs: 160,
+    energyBase: 0.0018,
+    calibrationMs: 900,
+    calibrationMultiplier: 1.16,
+    echoSuppressMs: 340,
+    bargeDynamicMultiplier: 1.07,
+    bargeAssistantFloorMultiplier: 1.14,
+    bargeStrongMultiplier: 1.06,
+    voiceRatioThreshold: 0.38,
+    backchannelMaxMs: 380,
+    bargeInMinMs: 1600,
+  },
+  ios: {
+    silenceMs: 800,
+    vadIntervalMs: 100,
+    bargeHoldMs: 95,
+    bargeStrongHoldMs: 160,
+    bargeMinAudioMs: 170,
+    energyBase: 0.0016,
+    calibrationMs: 1000,
+    calibrationMultiplier: 1.18,
+    echoSuppressMs: 360,
+    bargeDynamicMultiplier: 1.08,
+    bargeAssistantFloorMultiplier: 1.16,
+    bargeStrongMultiplier: 1.07,
+    voiceRatioThreshold: 0.38,
+    backchannelMaxMs: 400,
+    bargeInMinMs: 1700,
   },
 };
 const MIC_IDLE_TIMEOUT_MS = 30000;
 const TOP_POOL_LIMIT = 50;
 const TOP_VISIBLE_COUNT = 18;
 const TOP_ROTATE_MS = 18000;
+// Only Hindi (India) and English (India) — no other language auto-detection
 const RECOGNITION_LANGS = ["hi-IN", "en-IN"];
+const ALLOWED_RECOGNITION_LANGS = new Set(["hi-IN", "en-IN", "en-US", "en-GB"]);
 const MIN_AUTO_QUERY_WORDS = 1;
 const MIN_AUTO_QUERY_CHARS = 3;
 const HAS_MEDIA_RECORDER = typeof window !== "undefined" && typeof window.MediaRecorder !== "undefined";
 const USE_BROWSER_SPEECH_RECOGNITION = !HAS_MEDIA_RECORDER;
-const RECORDER_MIN_SEGMENT_MS = 420;
+// 1000ms minimum: recordings shorter than this are almost always noise, not speech
+const RECORDER_MIN_SEGMENT_MS = 1000;
 const RECORDER_MAX_SEGMENT_MS = 10000;
 const RECORDER_MIN_SEGMENT_BYTES = 1600;
 const RECORDER_MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
@@ -88,10 +101,11 @@ const detectVadProfile = () => {
 
 const VAD_PROFILE = detectVadProfile();
 const VAD = PLATFORM_VAD_CONFIG[VAD_PROFILE] || PLATFORM_VAD_CONFIG.desktop;
+// Raised caps: allows calibration to set a higher threshold in noisy rooms
 const VAD_MAX_THRESHOLD_BY_PROFILE = {
-  desktop: 0.0044,
-  android: 0.0038,
-  ios: 0.0034,
+  desktop: 0.008,
+  android: 0.007,
+  ios: 0.006,
 };
 const WS_PING_INTERVAL_MS = 15000;
 const WS_RECONNECT_BASE_MS = 900;
@@ -108,6 +122,8 @@ let rtcPeer = null;
 let rtcPeerId = "";
 let rtcDataChannel = null;
 let rtcReady = false;
+// WebRTC uplink: when enabled, mic audio travels via WebRTC track instead of MediaRecorder→WS
+let useWebrtcUplink = false;
 let sessionId = null;
 let sessionToken = null;
 let awaitingTurn = false;
@@ -128,6 +144,12 @@ let vadWorkletLoaded = false;
 let useWorkletVad = false;
 let latestMicRms = 0;
 let latestMicPeak = 0;
+// Default 1.0 (permissive) until the worklet computes its first FFT window
+let latestVoiceRatio = 1.0;
+// Smoothed voice ratio — exponential moving average over ~300ms of FFT frames.
+// A clap produces a brief spike; sustained speech maintains the ratio consistently.
+// α=0.15 ≈ time constant of ~6 frames × 20ms = 120ms smoothing window.
+let smoothedVoiceRatio = 1.0;
 let dynamicEnergyThreshold = VAD.energyBase;
 let speakingSince = 0;
 let lastSpeechAt = 0;
@@ -169,6 +191,8 @@ let sendingAudioQuery = false;
 let recorderStopInFlight = false;
 let recorderDropOnStop = false;
 let captureSpeechSince = 0;
+let lastTickSpeaking = false;       // tracks falling edge for backchannel detection
+let backchannelBurstStart = 0;      // when the current burst during assistant speech began
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -375,10 +399,8 @@ const loadDiscoverMovies = async () => {
 
 const wsUrl = () => {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const params = new URLSearchParams();
-  if (PAGE_API_KEY) params.set("api_key", PAGE_API_KEY);
-  const query = params.toString();
-  return `${protocol}://${window.location.host}/ws/voice${query ? `?${query}` : ""}`;
+  // API key is sent via X-API-Key header only — never in the URL to avoid leaking it in logs.
+  return `${protocol}://${window.location.host}/ws/voice`;
 };
 
 const withAuthHeaders = (headers = {}) => {
@@ -422,6 +444,7 @@ const closeWebRtcPeer = async () => {
   }
   rtcPeer = null;
   rtcReady = false;
+  useWebrtcUplink = false;
   const oldPeerId = rtcPeerId;
   rtcPeerId = "";
   if (oldPeerId) {
@@ -453,12 +476,16 @@ const connectWebRtcPeer = async () => {
   rtcDataChannel = pc.createDataChannel("audio_downlink");
   rtcDataChannel.onopen = () => {
     rtcReady = true;
+    // Uplink is ready when the downlink DataChannel is open and the server has the track
+    useWebrtcUplink = true;
   };
   rtcDataChannel.onclose = () => {
     rtcReady = false;
+    useWebrtcUplink = false;
   };
   rtcDataChannel.onerror = () => {
     rtcReady = false;
+    useWebrtcUplink = false;
   };
   rtcDataChannel.onmessage = (event) => {
     try {
@@ -674,7 +701,9 @@ const detectQueryLanguageHint = (text, fallback = "en") => {
 
   const hasLatin = /[A-Za-z]/.test(raw);
   const hasDevanagari = /[\u0900-\u097f]/.test(raw);
-  if (hasLatin && !hasDevanagari && hinglishHits >= 2) return "hi";
+  // Raised threshold from 2→3 to match server-side change — avoids
+  // false Hindi hint from incidental short English words.
+  if (hasLatin && !hasDevanagari && hinglishHits >= 3) return "hi";
   if (hasLatin && !hasDevanagari) return "en";
   if (!hasDevanagari) return fallbackHint;
 
@@ -923,9 +952,8 @@ const handleWsMessage = (payload) => {
   if (type === "text_delta") {
     markActivity();
     assistantStreamText += String(payload.delta || "");
-    if (!gotAudioThisTurn && currentAssistantSource !== "query") {
-      // Keep text/audio synchronized: before first audio chunk we can show deltas,
-      // after audio starts we switch to sentence updates from spoken chunks.
+    if (!gotAudioThisTurn) {
+      // Show the first streamed sentence immediately while audio for that sentence is being synthesized.
       updateConversation(undefined, assistantStreamText);
     }
     return;
@@ -981,6 +1009,7 @@ const handleWsMessage = (payload) => {
     markActivity();
     awaitingTurn = false;
     bargeRequested = false;
+    transcriptBlockUntil = Date.now() + 250;
     updateConversation(undefined, interruptionPrompt());
     setListeningStatus();
     if (USE_BROWSER_SPEECH_RECOGNITION && pendingTranscript.trim()) schedulePendingTranscriptSubmit(320);
@@ -1080,15 +1109,19 @@ const primeAudioPlayback = async () => {
 };
 
 const computeRmsEnergy = () => {
-  if (!analyser) return 0;
-  const data = new Uint8Array(analyser.fftSize);
-  analyser.getByteTimeDomainData(data);
-  let sum = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    const normalized = (data[i] - 128) / 128;
-    sum += normalized * normalized;
+  if (!analyser || !audioContext || audioContext.state === "closed") return 0;
+  try {
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 1) {
+      const normalized = (data[i] - 128) / 128;
+      sum += normalized * normalized;
+    }
+    return Math.sqrt(sum / data.length);
+  } catch (_) {
+    return 0;
   }
-  return Math.sqrt(sum / data.length);
 };
 
 const getMicEnergy = () => {
@@ -1117,6 +1150,8 @@ const detachVadWorklet = () => {
   useWorkletVad = false;
   latestMicRms = 0;
   latestMicPeak = 0;
+  latestVoiceRatio = 1.0;
+  smoothedVoiceRatio = 1.0;
 };
 
 const attachVadWorklet = async () => {
@@ -1137,8 +1172,23 @@ const attachVadWorklet = async () => {
       if (!payload || payload.type !== "vad_frame") return;
       const rms = Number(payload.rms || 0);
       const peak = Number(payload.peak || 0);
+      const voiceRatio = Number(payload.voice_ratio ?? 1.0);
       if (Number.isFinite(rms) && rms >= 0) latestMicRms = rms;
       if (Number.isFinite(peak) && peak >= 0) latestMicPeak = peak;
+      // voice_ratio: fraction of spectral energy in 85–3000 Hz voice band
+      if (Number.isFinite(voiceRatio) && voiceRatio >= 0) {
+        latestVoiceRatio = voiceRatio;
+        // EMA: only update when there is meaningful signal above the noise floor.
+        // During silence the FFT ratio is dominated by random noise — updating then
+        // would let noise gradually erode the smoothed value and cause false rejects.
+        if (rms > VAD.energyBase * 0.5) {
+          smoothedVoiceRatio = smoothedVoiceRatio * 0.85 + voiceRatio * 0.15;
+        } else {
+          // In silence, slowly drift back toward 1.0 (permissive) so the next
+          // genuine speech burst isn't blocked by a stale low ratio.
+          smoothedVoiceRatio = smoothedVoiceRatio * 0.97 + 1.0 * 0.03;
+        }
+      }
     };
     micSourceNode.connect(vadWorkletNode);
     vadSinkNode = audioContext.createGain();
@@ -1210,9 +1260,20 @@ const resetSpeechCaptureBuffers = () => {
 };
 
 const beginSpeechCapture = () => {
-  if (!HAS_MEDIA_RECORDER || !stream || sendingAudioQuery || awaitingTurn || isMicMuted) return;
+  if (!stream || sendingAudioQuery || awaitingTurn || isMicMuted) return;
   if (isRecordingSpeech) return;
 
+  // WebRTC uplink path: mic audio already flows via WebRTC track to server.
+  // Just signal the server to start buffering and track timing locally.
+  if (useWebrtcUplink && wsReady) {
+    isRecordingSpeech = true;
+    speechCaptureStartedAt = Date.now();
+    speechCaptureLastVoiceAt = speechCaptureStartedAt;
+    sendWs({ type: "utterance_start", peer_id: rtcPeerId || "" });
+    return;
+  }
+
+  if (!HAS_MEDIA_RECORDER) return;
   stopMediaRecorder(true);
   recorderMimeType = pickRecorderMimeType();
   recorderActiveChunks = [];
@@ -1230,7 +1291,17 @@ const beginSpeechCapture = () => {
 
   mediaRecorder.ondataavailable = (event) => {
     const chunk = event?.data;
-    if (chunk && chunk.size) recorderActiveChunks.push(chunk);
+    if (!chunk || !chunk.size) return;
+    recorderActiveChunks.push(chunk);
+    // Send each 500ms slice as a partial STT chunk for early context (fire-and-forget)
+    if (wsReady && sessionToken && Date.now() >= transcriptBlockUntil && !assistantSpeaking()) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const b64 = reader.result?.split(",")[1];
+        if (b64) sendWs({ type: "audio_chunk_partial", audio_b64: b64, lang_hint: lastDetectedLangHint || "en", session_token: sessionToken });
+      };
+      reader.readAsDataURL(chunk);
+    }
   };
 
   mediaRecorder.onerror = () => {
@@ -1261,12 +1332,14 @@ const beginSpeechCapture = () => {
     await submitVoiceAudioBlob(blob);
   };
 
+  // Set flag early to prevent re-entry before mediaRecorder.start() returns
+  isRecordingSpeech = true;
   try {
-    mediaRecorder.start();
-    isRecordingSpeech = true;
+    mediaRecorder.start(500); // 500ms timeslice → ondataavailable fires every 500ms for partial STT
     speechCaptureStartedAt = Date.now();
     speechCaptureLastVoiceAt = speechCaptureStartedAt;
   } catch (_) {
+    isRecordingSpeech = false;
     stopMediaRecorder(true);
   }
 };
@@ -1319,6 +1392,32 @@ const flushSpeechCaptureIfReady = async (force = false) => {
     return false;
   }
   if (!force && captureDuration < RECORDER_MIN_SEGMENT_MS) return false;
+
+  // WebRTC uplink path: send utterance_end signal; server extracts buffered PCM and runs STT
+  if (useWebrtcUplink && wsReady) {
+    isRecordingSpeech = false;
+    resetSpeechCaptureBuffers();
+    awaitingTurn = true;
+    sendingAudioQuery = true;
+    allowTranscriptDuringPlayback = false;
+    setStatus("Transcribing...");
+    updateConversation(undefined, "Searching best movies...");
+    markActivity();
+    const langHint = lastDetectedLangHint || (RECOGNITION_LANGS[recognitionLangIndex].startsWith("hi") ? "hi" : "en");
+    const sent = sendWs({
+      type: "utterance_end",
+      peer_id: rtcPeerId || "",
+      lang_hint: langHint,
+      session_token: sessionToken || "",
+    });
+    sendingAudioQuery = false;
+    if (!sent) {
+      awaitingTurn = false;
+      scheduleWsReconnect();
+    }
+    return true;
+  }
+
   if (!mediaRecorder || recorderStopInFlight) return false;
   recorderDropOnStop = false;
   recorderStopInFlight = true;
@@ -1445,6 +1544,10 @@ const submitVoiceQuery = (query) => {
     setStatus("Mic muted - tap red mute to continue");
     return false;
   }
+  if (!sessionToken) {
+    setStatus("Session ended. Tap voice to start a new session.");
+    return false;
+  }
   if (!wsReady) {
     setStatus("Reconnecting voice...");
     scheduleWsReconnect();
@@ -1502,7 +1605,22 @@ const processVadTick = () => {
   const now = Date.now();
   const energy = getMicEnergy();
   lastEnergy = energy;
-  const speaking = energy > dynamicEnergyThreshold;
+  // Require both sufficient energy AND sustained voice-band spectral content.
+  // Use the smoothed ratio (EMA over ~120ms) rather than the instantaneous value —
+  // a clap/door slam produces a brief spike that decays quickly in the EMA,
+  // while sustained speech keeps smoothedVoiceRatio consistently above the threshold.
+  const threshold = VAD.voiceRatioThreshold ?? 0.40;
+  const voiceRatioOk = !useWorkletVad || smoothedVoiceRatio >= threshold;
+  const speaking = energy > dynamicEnergyThreshold && voiceRatioOk;
+
+  // Backchannel filler — shown in UI when user makes a brief sound during assistant speech
+  const playBackchannelFiller = () => {
+    const fillersEn = ["Go on...", "Mm-hmm...", "Uh-huh..."];
+    const fillersHi = ["हाँ, बोलिए...", "जी, बताइए...", "हाँ..."];
+    const fillers = (lastDetectedLangHint === "hi") ? fillersHi : fillersEn;
+    const text = fillers[Math.floor(Math.random() * fillers.length)];
+    updateConversation(undefined, text);
+  };
 
   if (speaking) {
     lastSpeechAt = now;
@@ -1510,24 +1628,31 @@ const processVadTick = () => {
     if (assistantSpeaking()) {
       const warmup = audioStartedAt && now - audioStartedAt < 350;
       const minPlaybackElapsed = audioStartedAt && now - audioStartedAt >= VAD.bargeMinAudioMs;
-      assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
+      if (energy < dynamicEnergyThreshold * VAD.bargeDynamicMultiplier) {
+        assistantEnergyFloor = assistantEnergyFloor ? assistantEnergyFloor * 0.88 + energy * 0.12 : energy;
+      }
       const bargeLevel = Math.max(
         dynamicEnergyThreshold * VAD.bargeDynamicMultiplier,
         assistantEnergyFloor * VAD.bargeAssistantFloorMultiplier
       );
-      const strongVoice = energy > bargeLevel * 1.12;
+      const strongVoice = energy > bargeLevel * 1.08;
       if (!speakingSince) speakingSince = now;
-      const sustainedVoice = now - speakingSince >= VAD.bargeHoldMs + 80;
-      const strongVoiceOnly =
-        now - speakingSince >= VAD.bargeStrongHoldMs + 120 &&
-        energy > bargeLevel * (VAD.bargeStrongMultiplier + 0.12);
+      // Track burst start for backchannel/barge-in classification
+      if (!backchannelBurstStart) backchannelBurstStart = now;
+      const burstDuration = now - backchannelBurstStart;
+
+      // During assistant speech we ONLY trigger barge-in after sustained speech
+      // for bargeInMinMs (default 1500ms). The old 80ms/140ms thresholds are removed
+      // here — they were the root cause of clap/noise false triggers.
+      const fullBargeIn = burstDuration >= (VAD.bargeInMinMs ?? 1500);
       if (
         !warmup &&
         minPlaybackElapsed &&
         now >= suppressBargeUntil &&
         strongVoice &&
-        (sustainedVoice || strongVoiceOnly)
+        fullBargeIn
       ) {
+        backchannelBurstStart = 0;
         stopAssistantPlayback(true);
         beginSpeechCapture();
         speechCaptureLastVoiceAt = now;
@@ -1536,14 +1661,28 @@ const processVadTick = () => {
         playbackInterimText = "";
         playbackInterimAt = 0;
         setListeningStatus();
+        lastTickSpeaking = true;
         return;
       }
-      if (!strongVoice) speakingSince = 0;
+      if (!strongVoice) {
+        speakingSince = 0;
+        backchannelBurstStart = 0; // reset burst timer if voice drops below barge level
+      }
     } else {
       speakingSince = 0;
       if (!captureSpeechSince) captureSpeechSince = now;
     }
-    if (!awaitingTurn && !sendingAudioQuery && !isRecordingSpeech && now - captureSpeechSince >= 120) {
+    // Require 400ms of sustained energy above threshold before starting capture.
+    // Also gate on: not during assistant audio, not in echo-suppress window,
+    // not awaiting turn — prevents echo/noise from triggering STT.
+    if (
+      !awaitingTurn &&
+      !assistantSpeaking() &&
+      !sendingAudioQuery &&
+      !isRecordingSpeech &&
+      now >= transcriptBlockUntil &&
+      now - captureSpeechSince >= 400
+    ) {
       beginSpeechCapture();
     }
     if (isRecordingSpeech) {
@@ -1552,9 +1691,19 @@ const processVadTick = () => {
         void flushSpeechCaptureIfReady(true);
       }
     }
+    lastTickSpeaking = true;
     return;
   }
 
+  // Falling edge: speaking just ended
+  if (lastTickSpeaking && assistantSpeaking() && backchannelBurstStart) {
+    const burstDuration = now - backchannelBurstStart;
+    if (burstDuration > 0 && burstDuration < (VAD.backchannelMaxMs ?? 350)) {
+      playBackchannelFiller();
+    }
+    backchannelBurstStart = 0;
+  }
+  lastTickSpeaking = false;
   speakingSince = 0;
   captureSpeechSince = 0;
   if (!assistantSpeaking() && isRecordingSpeech && !awaitingTurn && !sendingAudioQuery) {
@@ -1691,8 +1840,12 @@ const stopVoiceMode = () => {
     }
   }
   micSourceNode = null;
-  if (audioContext) {
-    audioContext.close();
+  if (audioContext && audioContext.state !== "closed") {
+    try {
+      audioContext.close();
+    } catch (_) {
+      // ignore close race
+    }
   }
   audioContext = null;
   analyser = null;

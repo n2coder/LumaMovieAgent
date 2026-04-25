@@ -6,10 +6,10 @@ from uuid import uuid4
 import jwt
 from fastapi import HTTPException
 
-from app.config import Settings
+from voice_engine.config import VoiceSettings as Settings
 
 
-GREETING_TEXT = "Hi, I am Luma. Your movie recommendation agent. Tell me what kind of movie you feel like watching."
+GREETING_TEXT = "Hi! I am Luma. Main Hindi aur English dono samajh sakti hoon. Aap kaise help chahte hain?"
 
 
 @dataclass

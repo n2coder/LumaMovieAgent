@@ -3,7 +3,7 @@ import re
 from fastapi import HTTPException, UploadFile
 from openai import AsyncOpenAI, BadRequestError
 
-from app.config import Settings
+from voice_engine.config import VoiceSettings as Settings
 
 
 class STTService:

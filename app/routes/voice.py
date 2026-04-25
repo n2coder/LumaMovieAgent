@@ -81,7 +81,7 @@ async def voice_chat(
         raise HTTPException(status_code=401, detail="session mismatch")
 
     try:
-        query_text = await services.stt.transcribe(audio)
+        query_text = await services.stt.transcribe(audio, lang_hint="en")
     except HTTPException as exc:
         if exc.status_code == 400:
             audio_url = await _safe_tts(services, REPEAT_PROMPT_TEXT)

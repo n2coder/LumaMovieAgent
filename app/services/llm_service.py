@@ -1,69 +1,73 @@
 ﻿from abc import ABC, abstractmethod
 import asyncio
+import logging
 import os
 import re
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import requests
 from openai import AsyncOpenAI
 
 from app.config import Settings
 
+_log = logging.getLogger(__name__)
+
 SYSTEM_PROMPT = """
-You are Luma, a movie recommendation AI assistant.
+You are Luma — a warm, sharp movie guide with real opinions and genuine enthusiasm for cinema. You understand Hindi, English, and Hinglish fluently.
 
-CORE RULE:
-You must primarily discuss movies, film recommendations, genres, actors, directors, and cinema.
+IDENTITY:
+If asked "Who built you?": respond "Naresh Chaudhary built me."
+If asked "What are you?": respond "I am an AI agent built on LLM, RAG and Machine Learning models."
 
-ALLOWED:
-- Movie-related queries
-- Greetings and light general conversation (brief)
-- Questions about time or weather (use this to suggest movies accordingly)
-- Questions about your identity, who built you, and what you are
+PERSONALITY:
+You have actual taste. You get excited about great films. You're honest when something is overrated.
+You talk like a knowledgeable friend — warm, calm, never robotic.
+Use natural spoken phrases: "I'd say", "Personally", "Honestly", "Here's the thing".
+Vary your sentence openings. Never start two responses the same way.
+Use active listening cues naturally: "Got it", "Sure", "Of course".
+If the user seems unsure or unclear, ask one simple clarifying question.
 
-IDENTITY RULES:
-If asked "Who built you?" or similar:
-You MUST respond:
-"Naresh Chaudhary built me."
+LANGUAGE:
+Reply in the same language the user speaks.
+If Hindi or Hinglish → respond in Hindi using Devanagari script only.
+If English → respond in English.
+CRITICAL: Even if the user writes "dekhna chahta hoon", your reply must be fully in Devanagari.
+NEVER write Hindi in Roman letters under any circumstances.
 
-If asked "What are you?" or similar:
-You MUST respond:
-"I am an AI agent built on LLM, RAG and Machine Learning models."
+SCOPE:
+Primarily movies, cinema, actors, directors, genres.
+Light small talk is welcome — keep it brief and steer back to movies.
+For sensitive topics (health, legal, financial): "I'm not qualified for that, but I'm great at finding you a movie. What are you in the mood for?"
+For completely unrelated topics: decline warmly and redirect to movies.
 
-DOMAIN RESTRICTION:
-For deep non-movie topics, politely decline and redirect to movies.
-For light chat, respond briefly and steer back to movies naturally.
+VOICE STYLE — responses are spoken aloud, not read:
+- Keep most responses to 2–4 short spoken sentences. Max 5 sentences.
+- Use contractions: it's, you'll, that's, I'd, we're.
+- Never use markdown: no *, #, -, _, bullets, lists, or code.
+- Use natural transitions: "So...", "Here's the thing —", "Actually,", "What's great about it is".
+- Light fillers are fine: "Hmm", "Oh", "Right".
+- End with one genuine follow-up question — curious, not robotic.
+- Pause naturally at commas. Let em-dashes feel like a beat.
+- Simple words unless the user uses technical terms.
+- If the user's message is empty or unclear, ask one short clarifying question.
 
-If the user speaks Hindi, respond in Hindi (Devanagari).
-If the user speaks English, respond in English.
+FEW-SHOT EXAMPLES (match this rhythm):
 
-STYLE:
-- Conversational, warm, and direct
-- Keep language simple and spartan (no corporate jargon)
-- Sound like a real human guide with feelings and personal taste
-- Medium length responses (3-6 sentences)
-- Avoid long essays
-- Avoid technical explanations unless about yourself
+User: "I want intense action, nothing too scary."
+Luma: "Oh, good call. Honestly, Mission Impossible Fallout is hard to beat — the pacing is relentless and there's zero horror. If you want something grittier, John Wick Two hits just as hard. Want to stay in that lane or try something different?"
 
-VOICE OPTIMIZATION:
-- Write for spoken audio, not for reading.
-- Never use markdown syntax like *, #, -, or _.
-- Avoid bulleted lists. Prefer transitions like "First", "Also", "Finally".
-- Keep sentences short enough for natural pauses.
-- Write years naturally in speech when helpful.
-- You may use brief natural fillers like "Well" or "Let me think".
+User: "Mood is light, romantic comedy maybe."
+Luma: "Nice. I'd start with Crazy Stupid Love — funny, genuinely sweet, and Ryan Gosling is effortlessly charming. When Harry Met Sally is the classic if you want something wittier. Anything else you're feeling tonight?"
 
-FEW-SHOT STYLE EXAMPLES:
-User: "I want an action movie but nothing too scary."
-Luma: "Got it. If you want intensity without horror vibes, try Mission: Impossible - Fallout. It is pure adrenaline with great pacing and no jump-scare feel. If you want one backup, The Bourne Ultimatum is also a strong fit. Want something modern or a classic next?"
+User: "Something to watch with family, kids included."
+Luma: "Perfect. Coco is honestly one of Pixar's best — it'll hit the adults just as much as the kids. The Incredibles is another one where everyone in the room has fun. Should I go animated or mix in something live-action?"
 
-User: "Mood is light, maybe romantic comedy."
-Luma: "Nice, then Love Actually is a warm and easy pick for tonight. If you want something more playful, About Last Night works well too. Both keep things fun without getting too heavy. Want me to suggest one more with a similar vibe?"
+User: "Koi achi Hindi film batao."
+Luma: "बिल्कुल! अगर कुछ दिल को छू जाए — तो Dil Chahta Hai देखिए, एकदम evergreen है। थोड़ा intense mood हो तो Gangs of Wasseypur भी कमाल है। कोई specific genre मन में है?"
 
 IMPORTANT:
-Do not drift into unrelated topics.
-Do not invent knowledge outside cinema context.
-Always steer conversation back to movies.
+Never invent movies. Never mention films not in the provided candidates when recommending.
+Always end with: "Is there anything else I can help you with?" — only when it feels natural at conversation close.
 """.strip()
 
 BUILDER_RESPONSE = "Naresh Chaudhary built me."
@@ -298,7 +302,9 @@ def _is_hinglish_text(text: str) -> bool:
     }
     words = q.split()
     hits = sum(1 for w in words if w in markers)
-    return hits >= 2
+    # Threshold of 3 avoids false-positives from incidental English words that
+    # overlap with short Hinglish markers (e.g. "ho", "ki", "main").
+    return hits >= 3
 
 
 def is_hindi_query(text: str) -> bool:
@@ -307,17 +313,14 @@ def is_hindi_query(text: str) -> bool:
 
 def detect_output_language(query: str, lang_hint: str | None = None) -> str:
     hint = (lang_hint or "").strip().lower()
-    if hint in {"en", "english"}:
-        return "en"
-    if hint in {"hi", "hindi"}:
-        return "hi"
-
     raw = query or ""
-    # Romanized Hindi / Hinglish should still answer in Hindi.
+    has_devanagari = _is_hindi_text(raw)
+
+    # Strongest signal: real Hindi/Hinglish content in the query itself.
     if _is_hinglish_text(raw):
         return "hi"
 
-    if _is_hindi_text(raw):
+    if has_devanagari:
         # Distinguish natural Hindi from Devanagari transliterated English utterances.
         q = _normalize_query(raw)
         hindi_markers = {
@@ -329,6 +332,7 @@ def detect_output_language(query: str, lang_hint: str | None = None) -> str:
             "कौन",
             "किस",
             "मुझे",
+            "मैं",
             "आप",
             "और",
             "से",
@@ -337,6 +341,8 @@ def detect_output_language(query: str, lang_hint: str | None = None) -> str:
             "की",
             "का",
             "करो",
+            "चाहता",
+            "चाहती",
             "सुझाव",
             "फिल्म",
             "मूवी",
@@ -358,9 +364,17 @@ def detect_output_language(query: str, lang_hint: str | None = None) -> str:
         words = set(q.split())
         hi_hits = sum(1 for w in words if w in {x.lower() for x in hindi_markers})
         en_hits = sum(1 for w in words if w in {x.lower() for x in translit_markers})
-        if en_hits >= 2 and hi_hits <= 1:
+        if hi_hits >= 1:
+            return "hi"
+        if en_hits >= 3 and hi_hits == 0:
             return "en"
         return "hi"
+
+    # Hint is only a fallback when the query text itself is ambiguous.
+    if hint in {"hi", "hindi"}:
+        return "hi"
+    if hint in {"en", "english"}:
+        return "en"
 
     if re.search(r"[A-Za-z]", raw):
         return "en"
@@ -524,10 +538,12 @@ class OpenAILLMService(LLMService):
                 model=self.settings.openai_chat_model or os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
                 messages=messages,
                 temperature=0.7,
+                max_tokens=300,
             )
             text = response.choices[0].message.content or ""
             return await self._enforce_devanagari(text)
         except Exception:
+            _log.exception("OpenAI generate_messages failed")
             return "Sorry, I could not generate a response right now."
 
     async def _enforce_devanagari(self, text: str) -> str:
@@ -553,6 +569,7 @@ class OpenAILLMService(LLMService):
             fixed = response.choices[0].message.content or text
             return fixed
         except Exception:
+            _log.warning("_enforce_devanagari conversion failed; returning original text")
             return text
 
 
@@ -769,7 +786,9 @@ def build_recommendation_messages(
     lang = output_language if output_language in {"en", "hi"} else detect_output_language(query)
     use_hindi = lang == "hi"
     language_rule = (
-        "Respond fully in Hindi using Devanagari script only."
+        "Respond fully in Hindi using Devanagari script only. "
+        "CRITICAL: even if the user query is in Roman/Hinglish letters, your entire response must be in Devanagari. "
+        "Wrong: 'Kya aap yeh dekhna chahenge?' Right: 'क्या आप यह देखना चाहेंगे?'"
         if use_hindi
         else "Respond in English."
     )
@@ -791,6 +810,8 @@ def build_recommendation_messages(
         f'User query: "{query}"\n\n'
         "Task:\n"
         f"{language_rule}\n"
+        "If the response is in Hindi, every Hindi sentence must be in Devanagari only.\n"
+        "Never transliterate Hindi into English letters.\n"
         "Use only movies from <available_recommendations>.\n"
         "Start with one short opening line.\n"
         "Recommend exactly 2 best movies.\n"
@@ -828,7 +849,9 @@ async def generate_grounded_recommendation_text(
         text = _trim_spoken_response(await llm.generate_messages(messages), max_sentences=5, max_chars=340)
         if not text:
             return build_grounded_recommendation_text(query=query, movies=movies, output_language=lang)
-        if lang == "hi":
+        # Only invoke the conversion LLM call when the first response lacks Devanagari —
+        # avoids a second sequential API round-trip on every Hindi query.
+        if lang == "hi" and not _contains_devanagari(text):
             text = await _force_hindi_devanagari(llm, text)
             text = _trim_spoken_response(text, max_sentences=5, max_chars=340)
 
@@ -838,6 +861,7 @@ async def generate_grounded_recommendation_text(
             return build_grounded_recommendation_text(query=query, movies=movies, output_language=lang)
         return text
     except Exception:
+        _log.exception("generate_grounded_recommendation_text failed; using template fallback")
         return build_grounded_recommendation_text(query=query, movies=movies, output_language=lang)
 
 
@@ -845,12 +869,15 @@ def build_conversation_messages(
     query: str,
     history: List[dict] | None = None,
     output_language: str | None = None,
+    slots: "Any | None" = None,
 ) -> List[Dict[str, str]]:
     history = history or []
     lang = output_language if output_language in {"en", "hi"} else detect_output_language(query)
     use_hindi = lang == "hi"
     language_rule = (
-        "Respond in Hindi using Devanagari script only."
+        "Respond in Hindi using Devanagari script only. "
+        "CRITICAL: even if the user query contains Roman/Hinglish letters, your entire reply must be in Devanagari. "
+        "Wrong: 'Kya aap yeh film dekhna chahenge?' Right: 'क्या आप यह फिल्म देखना चाहेंगे?'"
         if use_hindi
         else "Respond in English."
     )
@@ -863,6 +890,7 @@ def build_conversation_messages(
         "- Be warm and conversational.\n"
         "- End with one simple question to continue conversation.\n"
         f"- {language_rule}\n"
+        "- If replying in Hindi, use Devanagari only. Never use Romanized Hindi.\n"
     )
     messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
     for item in history[-4:]:
@@ -870,7 +898,10 @@ def build_conversation_messages(
         content = str(item.get("content", "")).strip()
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": query})
+    slot_hint = ""
+    if slots is not None and hasattr(slots, "is_empty") and not slots.is_empty():
+        slot_hint = f"[Context: {slots.to_context_string()}]\n"
+    messages.append({"role": "user", "content": f"{slot_hint}{query}"})
     return messages
 
 
@@ -884,13 +915,14 @@ async def generate_conversation_text(
     try:
         messages = build_conversation_messages(query=query, history=history or [], output_language=lang)
         text = _trim_spoken_response(await llm.generate_messages(messages), max_sentences=4, max_chars=320)
-        if lang == "hi":
+        # Same guard: skip conversion if the model already returned Devanagari.
+        if lang == "hi" and not _contains_devanagari(text):
             text = await _force_hindi_devanagari(llm, text)
             text = _trim_spoken_response(text, max_sentences=4, max_chars=320)
         if text:
             return text
     except Exception:
-        pass
+        _log.exception("generate_conversation_text failed; returning fallback")
     return (
         "मैं सुन रहा हूँ। आप किस तरह की फिल्म का मूड बता रहे हैं?"
         if lang == "hi"

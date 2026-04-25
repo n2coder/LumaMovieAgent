@@ -11,3 +11,5 @@ openai==1.99.9
 requests==2.32.5
 faiss-cpu==1.12.0
 PyJWT==2.10.1
+redis[asyncio]>=5.0.0
+deepgram-sdk>=3.0.0

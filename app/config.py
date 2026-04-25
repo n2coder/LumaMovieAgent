@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_name: str = "Multilingual Voice AI Movie Assistant"
     app_env: str = "dev"
     app_host: str = "0.0.0.0"
-    app_port: int = 8000
+    app_port: int = 8002
     app_api_key: str = ""
     allowed_hosts: str = "localhost,127.0.0.1"
     max_query_chars: int = 500
@@ -31,11 +31,14 @@ class Settings(BaseSettings):
     openai_chat_model: str = "gpt-4o-mini"
     openai_stt_model: str = "gpt-4o-mini-transcribe"
     openai_tts_model: str = "gpt-4o-mini-tts"
-    openai_tts_voice: str = "alloy"
+    openai_tts_voice: str = "coral"
     openai_tts_speed: float = 1.3
     openai_tts_instructions: str = (
-        "Speak in clear Indian English with a warm, natural, conversational tone. "
-        "Sound human and emotionally present, and keep phrasing concise."
+        "You are Luma, a warm movie guide. "
+        "Speak at a natural conversational pace — not too fast, not too slow. "
+        "Sound like you are genuinely talking to a friend, not reading aloud. "
+        "Pause briefly at commas. Slow down just slightly on a movie title so it lands clearly. "
+        "Keep energy up — engaged and enthusiastic, never flat or robotic."
     )
 
     fine_tuned_endpoint: str = ""
@@ -45,6 +48,16 @@ class Settings(BaseSettings):
     top_k: int = 5
     use_vector_retriever: bool = True
     enable_webrtc_audio: bool = True
+    enable_webrtc_uplink: bool = False  # WebRTC audio uplink to STT (opt-in)
+
+    stt_provider: str = "deepgram"       # "deepgram" | "openai"
+    deepgram_api_key: str = ""
+    deepgram_model: str = "nova-2"
+
+    redis_url: str = "redis://localhost:6379/0"
+    redis_session_enabled: bool = True  # Set REDIS_SESSION_ENABLED=false to disable
+    partial_stt_enabled: bool = True     # Send 500ms audio chunks for early context
+    partial_stt_chunk_ttl_sec: int = 30  # Redis TTL for partial transcript keys
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     vector_metadata_pkl: str = "app/data/movie_metadata.pkl"
     vector_index_bin: str = "app/data/faiss_index.bin"

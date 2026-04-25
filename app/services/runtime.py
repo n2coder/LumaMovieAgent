@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from app.config import Settings
 from app.services.llm_service import LLMService
@@ -16,3 +17,5 @@ class AppServices:
     stt: STTService
     tts: TTSService
     session_tokens: SessionTokenManager
+    redis_store: Optional[object] = field(default=None)   # RedisSessionStore | None
+    deepgram_stt: Optional[object] = field(default=None)  # DeepgramSTTService | None
